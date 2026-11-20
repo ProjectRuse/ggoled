@@ -1,17 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod config;
 mod os;
 mod schedule;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
-use ggoled_draw::{DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextRenderer, bitmap_from_memory};
+use config::*;
+use ggoled_draw::{DrawDevice, DrawEvent, DrawLayer, LayerId, TextRenderer, bitmap_from_memory};
 use ggoled_lib::{Bitmap, Device};
-use ggoled_ticker::{GridHeader, Ticker, TickerConfig, TickerMode};
+use ggoled_ticker::{GridHeader, Ticker, TickerMode};
 use os::{Media, OSFeatures, OSImpl};
 use rfd::{MessageDialog, MessageLevel};
 use schedule::{DisplayMode, Segment, Timing};
 use sdl3_sys::everything as sdl;
-use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::{
     ffi::{CStr, CString},
@@ -24,156 +25,6 @@ use std::{
 };
 
 const NOTIF_DUR: Duration = Duration::from_secs(5);
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Debug)]
-enum ConfigTimeMode {
-    Off,
-    #[default]
-    H24,
-    H12,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq)]
-enum ConfigShiftMode {
-    Off,
-    Low,
-    #[default]
-    High,
-}
-impl ConfigShiftMode {
-    fn to_api(self) -> ShiftMode {
-        match self {
-            ConfigShiftMode::Off => ShiftMode::Off,
-            ConfigShiftMode::Low => ShiftMode::Low,
-            ConfigShiftMode::High => ShiftMode::High,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq)]
-enum ConfigQuitMode {
-    #[default]
-    Screensaver,
-    StockUi,
-}
-
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
-enum StatusNotifyMode {
-    Off,
-    #[default]
-    Notify,
-    Always,
-    WhenConnected,
-    WhenDisconnected,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct ConfigFont {
-    path: PathBuf,
-    size: f32,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(default)]
-struct Config {
-    font: Option<ConfigFont>,
-    time_mode: ConfigTimeMode,
-    show_media: bool,
-    idle_timeout: bool,
-    /// Seconds without keyboard/mouse input before the screensaver blanks the OLED.
-    idle_timeout_secs: u32,
-    /// Seconds to leave the SteelSeries volume screen up after a volume change (0 = off).
-    volume_overlay_secs: u32,
-    oled_shift: ConfigShiftMode,
-    status_notify: StatusNotifyMode,
-    quit_mode: ConfigQuitMode,
-    /// What the screen shows (schedule entries can override this).
-    display: DisplayMode,
-    ticker: TickerConfig,
-    /// Follow the [[schedule]] entries below.
-    schedule_enabled: bool,
-    /// Days that "weekends" means in the schedule (the rest are "weekdays"),
-    /// e.g. "sat-sun", "fri-sun", or "fri,sat,sun".
-    weekend_days: String,
-    scarlett: ScarlettConfig,
-    // Skipped when empty: "schedule = []" would clash with [[schedule]] entries
-    // added to the file later.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    schedule: Vec<Segment>,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(default)]
-struct ScarlettConfig {
-    /// Apply each schedule entry's scarlett_led_timeout by running `command`.
-    enabled: bool,
-    /// Program and arguments to run. "{seconds}" is replaced with the timeout.
-    /// The value is also written to ggoled_scarlett_led.txt next to the config file.
-    command: Vec<String>,
-}
-impl Default for ScarlettConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            command: vec![
-                "schtasks".into(),
-                "/run".into(),
-                "/tn".into(),
-                "ggoled Scarlett LEDs".into(),
-            ],
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            font: None,
-            time_mode: ConfigTimeMode::default(),
-            show_media: true,
-            idle_timeout: true,
-            idle_timeout_secs: 60,
-            volume_overlay_secs: 3,
-            oled_shift: ConfigShiftMode::default(),
-            status_notify: StatusNotifyMode::default(),
-            quit_mode: ConfigQuitMode::default(),
-            display: DisplayMode::Normal,
-            ticker: TickerConfig::default(),
-            schedule_enabled: false,
-            weekend_days: "sat-sun".into(),
-            scarlett: ScarlettConfig::default(),
-            schedule: vec![],
-        }
-    }
-}
-impl Config {
-    fn path() -> PathBuf {
-        directories::BaseDirs::new()
-            .unwrap()
-            .config_dir()
-            .join("ggoled_app.toml")
-    }
-    pub fn save(&self) -> anyhow::Result<()> {
-        let text = toml::to_string(self)?;
-        std::fs::write(Self::path(), text)?;
-        Ok(())
-    }
-    /// Load the config. A missing file gives the defaults; a broken file is an
-    /// error (rather than silently resetting, which would later overwrite it).
-    pub fn load() -> Result<(Config, Vec<Timing>), String> {
-        let text = match std::fs::read_to_string(Self::path()) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), vec![])),
-            Err(e) => return Err(format!("Couldn't read {}: {e}", Self::path().display())),
-        };
-        let conf: Config =
-            toml::from_str(&text).map_err(|e| format!("Problem in {}:\n\n{e}", Self::path().display()))?;
-        let problem = |e: String| format!("Problem in {}:\n\n{e}", Self::path().display());
-        let weekend = schedule::parse_weekend(&conf.weekend_days).map_err(problem)?;
-        let timings = schedule::parse(&conf.schedule, weekend).map_err(problem)?;
-        Ok((conf, timings))
-    }
-}
 
 fn show_warning(text: &str) {
     MessageDialog::new()

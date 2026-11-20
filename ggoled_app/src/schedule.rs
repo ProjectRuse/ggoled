@@ -19,7 +19,7 @@ pub enum DisplayMode {
     Ticker,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Segment {
     pub name: String,
@@ -32,7 +32,7 @@ pub struct Segment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub time_mode: Option<crate::ConfigTimeMode>,
+    pub time_mode: Option<crate::config::ConfigTimeMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub show_media: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
