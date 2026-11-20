@@ -5,10 +5,13 @@ night and the clock during the day.
 
 ## Setting it up
 
-1. Tray menu → **Schedule → Edit config file**. If you have no schedule yet, an
-   example is added to the bottom of the file (commented out).
-2. Edit the entries, save, then **Schedule → Reload config**.
-3. Turn on **Schedule → Follow schedule**.
+Tray menu → **Settings...** → **Schedule** tab: add entries, pick their days
+and start times, and tick the settings each one should change. Save, and turn
+on **Follow the schedule**. ggoled applies saved changes within a second.
+
+You can also edit the config file directly (tray: **Schedule → Edit config
+file**; if you have no schedule yet, a commented example is added at the
+bottom). Changes are picked up automatically when you save the file.
 
 The tray's top line shows what's in effect, e.g. `Now: Night (until Fri 08:00)`.
 

@@ -3,6 +3,7 @@
 mod config;
 mod os;
 mod schedule;
+mod settings;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
 use config::*;
@@ -224,6 +225,7 @@ enum MenuEvent {
     EditConfig,
     ReloadConfig,
     ReapplyScarlett,
+    OpenSettings,
     Quit,
 }
 
@@ -349,7 +351,17 @@ const SCHEDULE_EXAMPLE: &str = r##"
 # scarlett_led_timeout = 1800
 "##;
 
+fn config_file_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(Config::path()).and_then(|m| m.modified()).ok()
+}
+
 fn main() {
+    // `ggoled_app --settings` opens the settings window instead (the tray starts it this way)
+    if std::env::args().any(|a| a == "--settings") {
+        settings::run();
+        return;
+    }
+
     // Initial loading
     let (mut config, mut timings, mut config_save_blocked) = match Config::load() {
         Ok((config, timings)) => (config, timings, false),
@@ -383,6 +395,9 @@ fn main() {
     let tm_status =
         unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Schedule: off".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
     unsafe { sdl::SDL_SetTrayEntryEnabled(tm_status, false) };
+    let tm_settings =
+        unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Settings...".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
+    bind_menu_event(tm_settings, &menu_tx, MenuEvent::OpenSettings);
 
     // Schedule submenu
     let sched_entry = unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Schedule".as_ptr(), sdl::SDL_TRAYENTRY_SUBMENU) };
@@ -614,6 +629,9 @@ fn main() {
     let mut hold: Option<(usize, Option<DateTime<Local>>)> = None;
     let mut display_override: Option<(DisplayMode, Option<DateTime<Local>>)> = None;
     let mut shown_display: Option<DisplayMode> = None;
+    let mut settings_child: Option<std::process::Child> = None;
+    let mut config_mtime = config_file_mtime();
+    let mut last_config_check = Instant::now();
     let mut eff = Effective::new(&config, None);
     let mut last_active: Option<Option<usize>> = None;
     let mut applied_brightness: Option<u8> = None;
@@ -671,6 +689,16 @@ fn main() {
         }
 
         // Handle tray menu events
+        // Apply changes to the config file made elsewhere (settings window, hand edits)
+        if last_config_check.elapsed() >= Duration::from_secs(1) {
+            last_config_check = Instant::now();
+            let mtime = config_file_mtime();
+            if mtime != config_mtime {
+                config_mtime = mtime;
+                _ = menu_tx.send(MenuEvent::ReloadConfig);
+            }
+        }
+
         let mut config_updated = false;
         let mut refresh = false; // re-evaluate now, but nothing to save
         while let Ok(event) = menu_rx.try_recv() {
@@ -773,12 +801,16 @@ fn main() {
                 }
                 MenuEvent::ReloadConfig => match Config::load() {
                     Ok((new_config, new_timings)) => {
+                        // Keep an active hold/override unless the schedule itself changed
+                        let schedule_changed = new_config.schedule != config.schedule || new_timings != timings;
                         config = new_config;
                         timings = new_timings;
                         config_save_blocked = false;
-                        hold = None;
-                        display_override = None;
-                        config_updated = true;
+                        if schedule_changed {
+                            hold = None;
+                            display_override = None;
+                        }
+                        refresh = true; // just loaded it; nothing to write back
                         tm_time_radio.update_checked(config.time_mode);
                         tm_status_notify.update_checked(config.status_notify);
                         tm_idle_delay_radio.update_checked(config.idle_timeout_secs);
@@ -799,6 +831,19 @@ fn main() {
                     }
                     Err(e) => show_warning(&format!("{e}\n\nKept the previous settings.")),
                 },
+                MenuEvent::OpenSettings => {
+                    let running = settings_child
+                        .as_mut()
+                        .is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+                    if !running {
+                        match std::env::current_exe()
+                            .and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn())
+                        {
+                            Ok(child) => settings_child = Some(child),
+                            Err(e) => show_warning(&format!("Couldn't open settings: {e}")),
+                        }
+                    }
+                }
                 MenuEvent::ReapplyScarlett => scarlett.forget(),
                 MenuEvent::Quit => break 'main,
             }
@@ -810,6 +855,7 @@ fn main() {
         }
         if config_updated && !config_save_blocked {
             dialog_unwrap(config.save());
+            config_mtime = config_file_mtime();
         }
 
         let mut force_redraw = config_updated || refresh;

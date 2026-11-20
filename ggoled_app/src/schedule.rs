@@ -105,6 +105,14 @@ fn parse_day_spec(spec: &str, weekend: u8) -> Result<u8, String> {
     })
 }
 
+/// Lowercase day names as used in the config, Monday first.
+pub const DAY_KEYS: [&str; 7] = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+
+/// The set of days (bit 0 = Monday) a `days` list means.
+pub fn days_mask(days: &[String], weekend: u8) -> Result<u8, String> {
+    parse_days(days, weekend)
+}
+
 fn parse_days(days: &[String], weekend: u8) -> Result<u8, String> {
     if days.is_empty() {
         return Ok(ALL_DAYS);
