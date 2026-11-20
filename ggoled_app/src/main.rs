@@ -387,7 +387,13 @@ fn main() {
     assert!(!menu.is_null());
     let (menu_tx, menu_rx) = mpsc::channel::<MenuEvent>();
 
-    let version_label = format!("ggoled_app - v{}\0", env!("CARGO_PKG_VERSION"));
+    // CI builds include the commit they were built from, to tell test builds apart
+    let build = option_env!("GITHUB_SHA").map(|sha| format!(" ({})", &sha[..sha.len().min(7)]));
+    let version_label = format!(
+        "ggoled_app - v{}{}\0",
+        env!("CARGO_PKG_VERSION"),
+        build.unwrap_or_default()
+    );
     unsafe {
         let tm_version = sdl::SDL_InsertTrayEntryAt(menu, -1, version_label.as_ptr().cast(), sdl::SDL_TRAYENTRY_BUTTON);
         sdl::SDL_SetTrayEntryEnabled(tm_version, false);
@@ -929,7 +935,12 @@ fn main() {
             // Locked PC: use the chosen entry, after 5 s (a UAC prompt also briefly
             // looks locked). Unlocking takes effect immediately.
             let lock_idx = config.lock_entry_index();
-            if lock_idx.is_some() && os.is_locked() {
+            let lock_state = if lock_idx.is_some() {
+                os.is_locked()
+            } else {
+                Some(false)
+            };
+            if lock_state == Some(true) {
                 locked_since.get_or_insert_with(Instant::now);
             } else {
                 locked_since = None;
@@ -995,6 +1006,10 @@ fn main() {
             };
             let status = match display_override {
                 Some(_) if !locked => format!("{status} · display set manually"),
+                _ => status,
+            };
+            let status = match lock_state {
+                None => format!("{status} · can't detect locking"),
                 _ => status,
             };
             // Keep the Display menu showing what's actually on screen

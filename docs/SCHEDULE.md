@@ -87,7 +87,8 @@ Settings → Schedule → **When this PC is locked**: pick an entry (e.g. Night)
 to use whenever the PC is locked. It applies 5 seconds after locking (a UAC
 prompt also briefly looks like a lock, so short ones are ignored) and
 everything returns to normal on unlock; a hold you had stays. The tray shows
-"Locked: Night" meanwhile. Windows only for now.
+"Locked: Night" meanwhile, or "can't detect locking" if Windows won't report
+the lock state. Windows only for now.
 
 ```toml
 lock_entry = "Night"

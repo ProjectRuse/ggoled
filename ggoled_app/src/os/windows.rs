@@ -5,8 +5,9 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 };
 use windows_sys::Win32::{
-    System::StationsAndDesktops::{
-        CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
+    System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTSFreeMemory,
+        WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
     },
     System::SystemInformation::GetTickCount,
     UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
@@ -77,28 +78,35 @@ impl OSFeatures for OSImpl {
     fn set_idle_timeout(&mut self, ms: u32) {
         self.idle_timeout_ms = ms;
     }
-    fn is_locked(&mut self) -> bool {
-        // While locked, input goes to the lock screen's desktop, which normal
-        // programs can't open. Unlocked, the input desktop is "Default".
+    fn is_locked(&mut self) -> Option<bool> {
+        // Ask Windows for this session's lock state (what Task Manager and remote
+        // desktop tools use). Correct on Windows 10/11; Windows 7 reported it inverted.
         unsafe {
-            let desk = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
-            if desk.is_null() {
-                return true;
+            let mut buf: windows_sys::core::PWSTR = std::ptr::null_mut();
+            let mut len = 0u32;
+            if WTSQuerySessionInformationW(
+                WTS_CURRENT_SERVER_HANDLE,
+                WTS_CURRENT_SESSION,
+                WTSSessionInfoEx,
+                &mut buf,
+                &mut len,
+            ) == 0
+                || buf.is_null()
+            {
+                return None;
             }
-            let mut name = [0u16; 64];
-            let ok = GetUserObjectInformationW(
-                desk,
-                UOI_NAME,
-                name.as_mut_ptr().cast(),
-                (name.len() * 2) as u32,
-                std::ptr::null_mut(),
-            );
-            CloseDesktop(desk);
-            if ok == 0 {
-                return false; // can't tell; assume unlocked
-            }
-            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-            !String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("Default")
+            let result = if (len as usize) >= size_of::<WTSINFOEXW>() {
+                let info = &*(buf as *const WTSINFOEXW);
+                match (info.Level, info.Data.WTSInfoExLevel1.SessionFlags as u32) {
+                    (1, WTS_SESSIONSTATE_LOCK) => Some(true),
+                    (1, WTS_SESSIONSTATE_UNLOCK) => Some(false),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            WTSFreeMemory(buf.cast());
+            result
         }
     }
 }
