@@ -54,7 +54,7 @@ scarlett_led_timeout = 1800
 | Key | Values |
 |---|---|
 | `name` | Shown in the tray |
-| `days` | `"daily"`, `"weekdays"`, `"weekends"`, or day names `"mon"` … `"sun"`; a list, combinable. Empty = daily |
+| `days` | `"daily"`, `"weekdays"`, `"weekends"`, day names `"mon"` … `"sun"`, or ranges like `"fri-sun"`; a list, combinable. Empty = daily |
 | `start` | `"HH:MM"`, 24-hour |
 | `display` | `"Normal"` (time/media as enabled), `"Blank"` (dark; volume changes still show briefly), `"Stock"` (SteelSeries UI) |
 | `time_mode` | `"Off"`, `"H24"`, `"H12"` |
@@ -63,6 +63,14 @@ scarlett_led_timeout = 1800
 | `screensaver_secs` | Seconds of no keyboard/mouse input before blanking |
 | `brightness` | OLED brightness, 1–10. Stays at the last value set if a later entry doesn't specify one |
 | `scarlett_led_timeout` | Seconds; see below |
+
+## Weekends
+
+**Schedule → Weekend days** sets what `"weekends"` means: Sat–Sun or Fri–Sun.
+`"weekdays"` is everything else (Mon–Thu with a Fri–Sun weekend). For other
+splits, set `weekend_days` in the config file, e.g. `weekend_days = "fri,sat,sun"`.
+
+When entries share a name, the tray adds their days, e.g. "Day (Mon–Thu)".
 
 ## Holding an entry
 

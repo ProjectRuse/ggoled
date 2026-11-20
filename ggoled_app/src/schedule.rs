@@ -21,7 +21,8 @@ pub enum DisplayMode {
 #[serde(default)]
 pub struct Segment {
     pub name: String,
-    /// "daily", "weekdays", "weekends", or day names like "mon", "tue" (empty = daily)
+    /// "daily", "weekdays", "weekends", day names like "mon", or ranges like "fri-sun"
+    /// (empty = daily). "weekends" follows the weekend_days setting.
     pub days: Vec<String>,
     /// "HH:MM", 24-hour
     pub start: String,
@@ -52,33 +53,110 @@ pub struct Timing {
     pub start: NaiveTime,
 }
 
-const ALL_DAYS: u8 = 0b111_1111;
+pub const ALL_DAYS: u8 = 0b111_1111;
+pub const SAT_SUN: u8 = 0b110_0000;
+pub const FRI_SUN: u8 = 0b111_0000;
 
-fn parse_days(days: &[String]) -> Result<u8, String> {
+const DAY_NAMES: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+fn day_index(name: &str) -> Option<u32> {
+    let i = match name {
+        "mon" | "monday" => 0,
+        "tue" | "tues" | "tuesday" => 1,
+        "wed" | "wednesday" => 2,
+        "thu" | "thur" | "thurs" | "thursday" => 3,
+        "fri" | "friday" => 4,
+        "sat" | "saturday" => 5,
+        "sun" | "sunday" => 6,
+        _ => return None,
+    };
+    Some(i)
+}
+
+/// One day spec: a day ("fri"), a range ("fri-sun", may wrap: "sat-mon"), or a
+/// keyword ("daily", "weekdays", "weekends").
+fn parse_day_spec(spec: &str, weekend: u8) -> Result<u8, String> {
+    let spec = spec.trim().to_ascii_lowercase();
+    Ok(match spec.as_str() {
+        "daily" | "all" | "everyday" => ALL_DAYS,
+        "weekdays" => ALL_DAYS & !weekend,
+        "weekends" => weekend,
+        _ => {
+            if let Some((a, b)) = spec.split_once('-') {
+                let (Some(a), Some(b)) = (day_index(a.trim()), day_index(b.trim())) else {
+                    return Err(format!("unknown day range \"{spec}\""));
+                };
+                let mut mask = 0u8;
+                let mut i = a;
+                loop {
+                    mask |= 1 << i;
+                    if i == b {
+                        break;
+                    }
+                    i = (i + 1) % 7;
+                }
+                mask
+            } else {
+                1 << day_index(&spec).ok_or_else(|| format!("unknown day \"{spec}\""))?
+            }
+        }
+    })
+}
+
+fn parse_days(days: &[String], weekend: u8) -> Result<u8, String> {
     if days.is_empty() {
         return Ok(ALL_DAYS);
     }
-    let mut mask = 0u8;
-    for d in days {
-        mask |= match d.trim().to_ascii_lowercase().as_str() {
-            "daily" | "all" | "everyday" => ALL_DAYS,
-            "weekdays" => 0b001_1111,
-            "weekends" => 0b110_0000,
-            "mon" | "monday" => 1 << 0,
-            "tue" | "tuesday" => 1 << 1,
-            "wed" | "wednesday" => 1 << 2,
-            "thu" | "thursday" => 1 << 3,
-            "fri" | "friday" => 1 << 4,
-            "sat" | "saturday" => 1 << 5,
-            "sun" | "sunday" => 1 << 6,
-            other => return Err(format!("unknown day \"{other}\"")),
-        };
+    days.iter()
+        .try_fold(0u8, |mask, d| Ok(mask | parse_day_spec(d, weekend)?))
+}
+
+/// The weekend_days setting, e.g. "sat-sun" or "fri-sun".
+pub fn parse_weekend(spec: &str) -> Result<u8, String> {
+    let mask = spec
+        .split(',')
+        .try_fold(0u8, |mask, part| {
+            Ok::<u8, String>(mask | parse_day_spec(part, SAT_SUN)?)
+        })
+        .map_err(|e| format!("weekend_days: {e}"))?;
+    if mask == 0 || mask == ALL_DAYS {
+        return Err("weekend_days must include some days, but not all of them".into());
     }
     Ok(mask)
 }
 
+/// Readable form of a set of days: "Daily", "Mon–Thu", "Fri–Sun", "Mon, Wed".
+pub fn days_label(mask: u8) -> String {
+    if mask & ALL_DAYS == ALL_DAYS {
+        return "Daily".into();
+    }
+    let mut runs: Vec<(usize, usize)> = vec![];
+    for i in 0..7 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((_, end)) if *end + 1 == i => *end = i,
+            _ => runs.push((i, i)),
+        }
+    }
+    // join a run ending on Sunday with one starting on Monday (e.g. Sat–Mon)
+    if runs.len() > 1 && runs[0].0 == 0 && runs.last().unwrap().1 == 6 {
+        let first = runs.remove(0);
+        runs.last_mut().unwrap().1 = first.1;
+    }
+    runs.iter()
+        .map(|&(a, b)| match (a, b) {
+            _ if a == b => DAY_NAMES[a].to_string(),
+            _ if (a + 1) % 7 == b => format!("{}, {}", DAY_NAMES[a], DAY_NAMES[b]),
+            _ => format!("{}–{}", DAY_NAMES[a], DAY_NAMES[b]),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Check and parse every segment. Errors name the segment so they're easy to fix.
-pub fn parse(segments: &[Segment]) -> Result<Vec<Timing>, String> {
+pub fn parse(segments: &[Segment], weekend: u8) -> Result<Vec<Timing>, String> {
     segments
         .iter()
         .enumerate()
@@ -90,7 +168,7 @@ pub fn parse(segments: &[Segment]) -> Result<Vec<Timing>, String> {
             };
             let start = NaiveTime::parse_from_str(seg.start.trim(), "%H:%M")
                 .map_err(|_| format!("{label}: start \"{}\" should look like \"08:00\"", seg.start))?;
-            let days = parse_days(&seg.days).map_err(|e| format!("{label}: {e}"))?;
+            let days = parse_days(&seg.days, weekend).map_err(|e| format!("{label}: {e}"))?;
             if let Some(b) = seg.brightness
                 && !(1..=10).contains(&b)
             {
@@ -165,11 +243,14 @@ mod tests {
 
     // 2026-11-20 is a Friday, 2026-11-21 Saturday, 2026-11-23 Monday
     fn sample() -> Vec<Timing> {
-        parse(&[
-            seg("Night", &["daily"], "00:00"),
-            seg("Day", &["weekdays"], "08:00"),
-            seg("Day", &["weekends"], "10:00"),
-        ])
+        parse(
+            &[
+                seg("Night", &["daily"], "00:00"),
+                seg("Day", &["weekdays"], "08:00"),
+                seg("Day", &["weekends"], "10:00"),
+            ],
+            SAT_SUN,
+        )
         .unwrap()
     }
 
@@ -186,10 +267,10 @@ mod tests {
     #[test]
     fn carries_over_from_previous_days() {
         // Only one segment, starting Mondays: on Thursday it's still in effect.
-        let t = parse(&[seg("Weekly", &["mon"], "12:00")]).unwrap();
+        let t = parse(&[seg("Weekly", &["mon"], "12:00")], SAT_SUN).unwrap();
         assert_eq!(active(&t, at(2026, 11, 26, 3, 0)), Some(0));
         // Night-only schedule starting 22:00: just after midnight is still "night"
-        let t = parse(&[seg("Late", &["daily"], "22:00")]).unwrap();
+        let t = parse(&[seg("Late", &["daily"], "22:00")], SAT_SUN).unwrap();
         assert_eq!(active(&t, at(2026, 11, 20, 1, 0)), Some(0));
     }
 
@@ -207,9 +288,37 @@ mod tests {
 
     #[test]
     fn rejects_bad_input() {
-        assert!(parse(&[seg("X", &["funday"], "08:00")]).is_err());
-        assert!(parse(&[seg("X", &[], "8am")]).is_err());
-        assert!(parse(&[seg("X", &[], "25:00")]).is_err());
-        assert_eq!(parse(&[seg("X", &[], "8:05")]).unwrap()[0].days, ALL_DAYS);
+        assert!(parse(&[seg("X", &["funday"], "08:00")], SAT_SUN).is_err());
+        assert!(parse(&[seg("X", &[], "8am")], SAT_SUN).is_err());
+        assert!(parse(&[seg("X", &[], "25:00")], SAT_SUN).is_err());
+        assert!(parse(&[seg("X", &["fri-funday"], "08:00")], SAT_SUN).is_err());
+        assert_eq!(parse(&[seg("X", &[], "8:05")], SAT_SUN).unwrap()[0].days, ALL_DAYS);
+    }
+
+    #[test]
+    fn weekend_setting_and_ranges() {
+        let segs = [seg("A", &["weekdays"], "08:00"), seg("B", &["weekends"], "10:00")];
+        let t = parse(&segs, FRI_SUN).unwrap();
+        assert_eq!(t[0].days, 0b000_1111); // Mon-Thu
+        assert_eq!(t[1].days, FRI_SUN);
+        // Friday 9:00 with a Fri-Sun weekend: weekday entry doesn't apply on Friday,
+        // so Thursday's 08:00 "A" is still in effect until 10:00
+        assert_eq!(active(&t, at(2026, 11, 20, 9, 0)), Some(0));
+        assert_eq!(active(&t, at(2026, 11, 20, 10, 0)), Some(1));
+        let r = parse(&[seg("W", &["sat-mon"], "08:00")], SAT_SUN).unwrap();
+        assert_eq!(r[0].days, 0b110_0001);
+        assert_eq!(parse_weekend("fri-sun").unwrap(), FRI_SUN);
+        assert_eq!(parse_weekend("sat,sun").unwrap(), SAT_SUN);
+        assert!(parse_weekend("daily").is_err());
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(days_label(ALL_DAYS), "Daily");
+        assert_eq!(days_label(0b000_1111), "Mon–Thu");
+        assert_eq!(days_label(FRI_SUN), "Fri–Sun");
+        assert_eq!(days_label(SAT_SUN), "Sat, Sun");
+        assert_eq!(days_label(0b110_0001), "Sat–Mon");
+        assert_eq!(days_label(0b000_0101), "Mon, Wed");
     }
 }

@@ -87,6 +87,9 @@ struct Config {
     quit_mode: ConfigQuitMode,
     /// Follow the [[schedule]] entries below.
     schedule_enabled: bool,
+    /// Days that "weekends" means in the schedule (the rest are "weekdays"),
+    /// e.g. "sat-sun", "fri-sun", or "fri,sat,sun".
+    weekend_days: String,
     scarlett: ScarlettConfig,
     // Skipped when empty: "schedule = []" would clash with [[schedule]] entries
     // added to the file later.
@@ -130,6 +133,7 @@ impl Default for Config {
             status_notify: StatusNotifyMode::default(),
             quit_mode: ConfigQuitMode::default(),
             schedule_enabled: false,
+            weekend_days: "sat-sun".into(),
             scarlett: ScarlettConfig::default(),
             schedule: vec![],
         }
@@ -157,8 +161,9 @@ impl Config {
         };
         let conf: Config =
             toml::from_str(&text).map_err(|e| format!("Problem in {}:\n\n{e}", Self::path().display()))?;
-        let timings =
-            schedule::parse(&conf.schedule).map_err(|e| format!("Problem in {}:\n\n{e}", Self::path().display()))?;
+        let problem = |e: String| format!("Problem in {}:\n\n{e}", Self::path().display());
+        let weekend = schedule::parse_weekend(&conf.weekend_days).map_err(problem)?;
+        let timings = schedule::parse(&conf.schedule, weekend).map_err(problem)?;
         Ok((conf, timings))
     }
 }
@@ -350,6 +355,7 @@ enum MenuEvent {
     SetQuitMode(ConfigQuitMode),
     SetIdleDelay(u32),
     SetVolumeOverlay(u32),
+    SetWeekend(u8),
     ToggleSchedule,
     /// Some(i): hold schedule entry i until the next entry starts. None: end the hold.
     Hold(Option<usize>),
@@ -406,10 +412,17 @@ fn menu_check_dyn(menu: *mut sdl::SDL_TrayMenu, pos: i32, label: &CStr, checked:
     unsafe { sdl::SDL_InsertTrayEntryAt(menu, pos, label.as_ptr(), sdl::SDL_TRAYENTRY_CHECKBOX | checked) }
 }
 
-fn segment_label(schedule: &[Segment], i: usize) -> String {
-    match schedule.get(i) {
+/// Name for an entry, with its days added when several entries share a name
+/// (e.g. "Day (Mon–Thu)" and "Day (Fri–Sun)").
+fn segment_label(schedule: &[Segment], timings: &[Timing], i: usize) -> String {
+    let name = match schedule.get(i) {
         Some(seg) if !seg.name.is_empty() => seg.name.clone(),
-        _ => format!("entry #{}", i + 1),
+        _ => return format!("entry #{}", i + 1),
+    };
+    let shared = schedule.iter().filter(|s| s.name == name).count() > 1;
+    match timings.get(i) {
+        Some(t) if shared => format!("{name} ({})", schedule::days_label(t.days)),
+        _ => name,
     }
 }
 
@@ -421,13 +434,14 @@ fn rebuild_hold_entries(
     menu: *mut sdl::SDL_TrayMenu,
     entries: &mut Vec<*mut sdl::SDL_TrayEntry>,
     schedule: &[Segment],
+    timings: &[Timing],
     tx: &mpsc::Sender<MenuEvent>,
 ) {
     for entry in entries.drain(..) {
         unsafe { sdl::SDL_RemoveTrayEntry(entry) };
     }
     for i in 0..schedule.len() {
-        let label = CString::new(format!("Hold: {}", segment_label(schedule, i)).replace('\0', "")).unwrap();
+        let label = CString::new(format!("Hold: {}", segment_label(schedule, timings, i)).replace('\0', "")).unwrap();
         let entry = menu_check_dyn(menu, HOLD_MENU_POS + i as i32, &label, false);
         bind_menu_event(entry, tx, MenuEvent::Hold(Some(i)));
         entries.push(entry);
@@ -441,7 +455,8 @@ const SCHEDULE_EXAMPLE: &str = r##"
 #
 # Each entry starts at `start` on its `days` and lasts until the next entry
 # starts. Anything an entry leaves out uses the normal tray settings.
-#   days:     "daily", "weekdays", "weekends", or "mon", "tue", ... (list)
+#   days:     "daily", "weekdays", "weekends", "mon", ..., or ranges like "fri-sun" (list)
+#             "weekends" follows Schedule > Weekend days in the tray (Sat-Sun or Fri-Sun)
 #   display:  "Normal" (time/media as usual), "Blank" (dark), "Stock" (SteelSeries UI)
 #   time_mode: "Off", "H24", "H12"      show_media: true/false
 #   screensaver: true/false             screensaver_secs: seconds
@@ -533,8 +548,17 @@ fn main() {
         )
     };
     bind_menu_event(tm_scarlett, &menu_tx, MenuEvent::ReapplyScarlett);
+    let weekend_mask = |config: &Config| schedule::parse_weekend(&config.weekend_days).unwrap_or(schedule::SAT_SUN);
+    let tm_weekend_radio = RadioMenu::new(
+        sched_menu,
+        c"Weekend days",
+        &[(c"Sat–Sun", schedule::SAT_SUN), (c"Fri–Sun", schedule::FRI_SUN)],
+        weekend_mask(&config),
+        &menu_tx,
+        MenuEvent::SetWeekend,
+    );
     let mut hold_entries: Vec<*mut sdl::SDL_TrayEntry> = vec![];
-    rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &menu_tx);
+    rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &timings, &menu_tx);
     unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON) }; // separator
 
     let tm_time_radio = RadioMenu::new(
@@ -792,6 +816,24 @@ fn main() {
                     config.volume_overlay_secs = secs;
                     tm_volume_radio.update_checked(secs);
                 }
+                MenuEvent::SetWeekend(mask) => {
+                    tm_weekend_radio.update_checked(mask);
+                    let spec = if mask == schedule::FRI_SUN {
+                        "fri-sun"
+                    } else {
+                        "sat-sun"
+                    };
+                    match schedule::parse(&config.schedule, mask) {
+                        Ok(new_timings) => {
+                            config.weekend_days = spec.into();
+                            timings = new_timings;
+                            hold = None;
+                            config_updated = true;
+                            rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &timings, &menu_tx);
+                        }
+                        Err(e) => show_warning(&e),
+                    }
+                }
                 MenuEvent::ToggleSchedule => {
                     config_updated = true;
                     config.schedule_enabled = unsafe { sdl::SDL_GetTrayEntryChecked(tm_sched_enabled) };
@@ -826,13 +868,14 @@ fn main() {
                         tm_volume_radio.update_checked(config.volume_overlay_secs);
                         tm_shift_radio.update_checked(config.oled_shift);
                         tm_quit_mode_radio.update_checked(config.quit_mode);
+                        tm_weekend_radio.update_checked(weekend_mask(&config));
                         unsafe {
                             sdl::SDL_SetTrayEntryChecked(tm_media_check, config.show_media);
                             sdl::SDL_SetTrayEntryChecked(tm_idle_check, config.idle_timeout);
                             sdl::SDL_SetTrayEntryChecked(tm_sched_enabled, config.schedule_enabled);
                         }
                         dev.set_shift_mode(config.oled_shift.to_api());
-                        rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &menu_tx);
+                        rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &timings, &menu_tx);
                     }
                     Err(e) => show_warning(&format!("{e}\n\nKept the previous settings.")),
                 },
@@ -941,11 +984,15 @@ fn main() {
             };
             let status = match (hold, active_idx) {
                 (Some((i, until)), _) => {
-                    format!("Holding: {} ({})", segment_label(&config.schedule, i), until_str(until))
+                    format!(
+                        "Holding: {} ({})",
+                        segment_label(&config.schedule, &timings, i),
+                        until_str(until)
+                    )
                 }
                 (None, Some(i)) => format!(
                     "Now: {} ({})",
-                    segment_label(&config.schedule, i),
+                    segment_label(&config.schedule, &timings, i),
                     until_str(schedule::next_boundary(&timings, time))
                 ),
                 (None, None) if config.schedule_enabled => "Schedule: no entries".to_string(),
