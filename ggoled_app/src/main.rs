@@ -249,7 +249,9 @@ impl ScarlettSync {
         if !config.enabled || config.command.is_empty() || self.applied == Some(want) || media_playing {
             return;
         }
-        if self.last_attempt.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+        // The scheduled task ignores a second start while one is running; the script
+        // re-reads the value when it finishes, so a short gap is enough.
+        if self.last_attempt.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
             return;
         }
         self.last_attempt = Some(Instant::now());

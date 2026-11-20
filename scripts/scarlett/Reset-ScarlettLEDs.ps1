@@ -97,6 +97,15 @@ try {
         & wsl @wslArgs -u root -- python3 $wslPath status
     } else {
         & wsl @wslArgs -u root -- python3 $wslPath sleep $Seconds
+        # ggoled may have asked for a different value while this ran (the task
+        # ignores a second start), so apply again if the file changed meanwhile.
+        for ($i = 0; $FromFile -and $i -lt 3; $i++) {
+            $latest = (Get-Content $valueFile -Raw).Trim()
+            if ($latest -notmatch '^\d+$' -or [int]$latest -eq $Seconds -or [int]$latest -gt 86400) { break }
+            $Seconds = [int]$latest
+            Write-Host "$(Get-Date -Format s) Value changed meanwhile; setting $Seconds s"
+            & wsl @wslArgs -u root -- python3 $wslPath sleep $Seconds
+        }
     }
     if ($LASTEXITCODE -ne 0) { Write-Host "scarlett_fp.py reported an error (see above)." -ForegroundColor Yellow }
 }
