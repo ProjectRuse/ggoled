@@ -6,12 +6,13 @@ mod schedule;
 use chrono::{DateTime, Local, TimeDelta, Timelike};
 use ggoled_draw::{DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextRenderer, bitmap_from_memory};
 use ggoled_lib::{Bitmap, Device};
-use ggoled_ticker::{Ticker, TickerConfig, TickerMode};
+use ggoled_ticker::{GridHeader, Ticker, TickerConfig, TickerMode};
 use os::{Media, OSFeatures, OSImpl};
 use rfd::{MessageDialog, MessageLevel};
 use schedule::{DisplayMode, Segment, Timing};
 use sdl3_sys::everything as sdl;
 use serde::{Deserialize, Serialize};
+use std::hash::{Hash, Hasher};
 use std::{
     ffi::{CStr, CString},
     fmt::Debug,
@@ -760,6 +761,8 @@ fn main() {
     let mut screen_blank = false;
     let mut stock_ui = false;
     let mut hold: Option<(usize, Option<DateTime<Local>>)> = None;
+    let mut display_override: Option<(DisplayMode, Option<DateTime<Local>>)> = None;
+    let mut shown_display: Option<DisplayMode> = None;
     let mut eff = Effective::new(&config, None);
     let mut last_active: Option<Option<usize>> = None;
     let mut applied_brightness: Option<u8> = None;
@@ -770,6 +773,8 @@ fn main() {
     let mut ticker_layer: Option<LayerId> = None;
     let mut ticker_key: Option<(u64, TickerMode, usize)> = None;
     let mut ticker_prefetched: Option<i64> = None;
+    let mut ticker_header_layer: Option<LayerId> = None;
+    let mut ticker_header_text: Option<String> = None;
 
     // Wait for connect
     let mut last_connect = Instant::now() - Duration::from_secs(1);
@@ -861,6 +866,14 @@ fn main() {
                     config_updated = true;
                     config.display = display;
                     tm_display_radio.update_checked(display);
+                    // If the current schedule entry sets the display, picking one here
+                    // overrides it until the next entry starts (like a hold).
+                    let entry_sets_display = last_active
+                        .flatten()
+                        .and_then(|i| config.schedule.get(i))
+                        .is_some_and(|seg| seg.display.is_some());
+                    display_override =
+                        entry_sets_display.then(|| (display, schedule::next_boundary(&timings, Local::now())));
                 }
                 MenuEvent::SetTickerMode(mode) => {
                     config_updated = true;
@@ -913,6 +926,7 @@ fn main() {
                         timings = new_timings;
                         config_save_blocked = false;
                         hold = None;
+                        display_override = None;
                         config_updated = true;
                         tm_time_radio.update_checked(config.time_mode);
                         tm_status_notify.update_checked(config.status_notify);
@@ -1019,7 +1033,15 @@ fn main() {
                 None if config.schedule_enabled => schedule::active(&timings, time),
                 None => None,
             };
+            if let Some((_, Some(until))) = display_override
+                && time >= until
+            {
+                display_override = None;
+            }
             eff = Effective::new(&config, active_idx.and_then(|i| config.schedule.get(i)));
+            if let Some((display, _)) = display_override {
+                eff.display = display;
+            }
             if last_active != Some(active_idx) {
                 last_active = Some(active_idx);
                 last_media = None; // relayout with the new settings
@@ -1053,6 +1075,15 @@ fn main() {
                 (None, None) if config.schedule_enabled => "Schedule: no entries".to_string(),
                 (None, None) => "Schedule: off".to_string(),
             };
+            let status = match display_override {
+                Some(_) => format!("{status} · display set manually"),
+                None => status,
+            };
+            // Keep the Display menu showing what's actually on screen
+            if shown_display != Some(eff.display) {
+                shown_display = Some(eff.display);
+                tm_display_radio.update_checked(eff.display);
+            }
             if status != last_status {
                 if let Ok(c) = CString::new(status.clone()) {
                     unsafe { sdl::SDL_SetTrayEntryLabel(tm_status, c.as_ptr()) };
@@ -1074,6 +1105,8 @@ fn main() {
                 notif_layer = None;
                 ticker_layer = None;
                 ticker_key = None;
+                ticker_header_layer = None;
+                ticker_header_text = None;
                 last_media = None; // reset media so we check again when not idle
             } else if show_ticker {
                 // Price ticker replaces the clock and media
@@ -1104,20 +1137,69 @@ fn main() {
                         ticker.request_refresh();
                     }
                 }
+                let margin = match config.oled_shift {
+                    ConfigShiftMode::Off => 0,
+                    ConfigShiftMode::Low => 1,
+                    ConfigShiftMode::High => 4,
+                };
+                let (main_q, compact_q) = ticker.split_quotes();
+                let (grid_rows, grid_pages) = ggoled_ticker::grid_pages(main_q.len(), !compact_q.is_empty());
                 let step = time.timestamp().max(0) as usize / tcfg.cycle_secs.max(1) as usize;
                 let page = match tcfg.mode {
                     TickerMode::Cycle => step % quotes.len().max(1),
-                    TickerMode::Grid => step % quotes.len().div_ceil(ggoled_ticker::GRID_ROWS).max(1),
+                    TickerMode::Grid => step % grid_pages,
                     TickerMode::Scroll => 0,
                 };
-                // For scrolling, only rebuild when the text changes (rebuilding restarts the scroll)
-                let content = match tcfg.mode {
-                    TickerMode::Scroll => {
-                        let mut h = std::hash::DefaultHasher::new();
-                        std::hash::Hash::hash(&ggoled_ticker::scroll_text(&quotes), &mut h);
-                        std::hash::Hasher::finish(&h)
+
+                // List layout: top row (time or media) when there's a spare row
+                let mut header_text: Option<String> = None;
+                let mut header_scroll: Option<String> = None;
+                if tcfg.mode == TickerMode::Grid
+                    && grid_pages == 1
+                    && ggoled_ticker::grid_has_header_room(main_q.len(), !compact_q.is_empty())
+                {
+                    let time_text = match eff.time_mode {
+                        ConfigTimeMode::Off => None,
+                        ConfigTimeMode::H24 => Some(time.format("%H:%M:%S").to_string()),
+                        ConfigTimeMode::H12 => Some(time.format("%l:%M:%S %p").to_string().trim().to_string()),
+                    };
+                    let media_text = playing_media.as_ref().map(|m| match m.artist.is_empty() {
+                        true => m.title.clone(),
+                        false => format!("{} - {}", m.title, m.artist),
+                    });
+                    match (tcfg.grid_header, media_text) {
+                        (GridHeader::Media, Some(m)) => {
+                            if ticker_fonts.small.render_line(&m).w > ggoled_ticker::WIDTH - 2 * margin {
+                                header_scroll = Some(m);
+                            } else {
+                                header_text = Some(m);
+                            }
+                        }
+                        (GridHeader::None, _) => {}
+                        _ => header_text = time_text,
                     }
-                    _ => ticker.generation(),
+                }
+                // Scrolling header text lives in its own layer, only rebuilt when it changes
+                if header_scroll.as_deref() != ticker_header_text.as_deref() {
+                    if let Some(id) = ticker_header_layer.take() {
+                        dev.remove_layer(id);
+                    }
+                    if let Some(text) = &header_scroll {
+                        let bitmap = Arc::new(ticker_fonts.small.render_line(text));
+                        ticker_header_layer = Some(dev.add_layer(DrawLayer::Scroll { bitmap, y: -2 }));
+                    }
+                    ticker_header_text = header_scroll.clone();
+                }
+
+                // What's on screen; rebuild only when it changes (rebuilding restarts scrolling)
+                let content = {
+                    let mut h = std::hash::DefaultHasher::new();
+                    match tcfg.mode {
+                        TickerMode::Scroll => ggoled_ticker::scroll_text(&quotes).hash(&mut h),
+                        _ => ticker.generation().hash(&mut h),
+                    }
+                    (&header_text, &header_scroll, margin).hash(&mut h);
+                    h.finish()
                 };
                 let key = (content, tcfg.mode, page);
                 if ticker_key != Some(key) {
@@ -1129,18 +1211,29 @@ fn main() {
                     if !quotes.is_empty() {
                         let layer = match tcfg.mode {
                             TickerMode::Cycle => DrawLayer::Image {
-                                bitmap: Arc::new(ggoled_ticker::render_cycle(&quotes[page], &ticker_fonts)),
+                                bitmap: Arc::new(ggoled_ticker::render_cycle(&quotes[page], &ticker_fonts, margin)),
                                 x: 0,
                                 y: 0,
                             },
-                            TickerMode::Grid => DrawLayer::Image {
-                                bitmap: Arc::new(ggoled_ticker::render_grid(
-                                    &quotes[page * ggoled_ticker::GRID_ROWS..],
-                                    &ticker_fonts,
-                                )),
-                                x: 0,
-                                y: 0,
-                            },
+                            TickerMode::Grid => {
+                                let header = match (&header_text, &header_scroll) {
+                                    (Some(t), _) => ggoled_ticker::Header::Text(t),
+                                    (None, Some(_)) => ggoled_ticker::Header::Reserved,
+                                    _ => ggoled_ticker::Header::None,
+                                };
+                                let start = (page * grid_rows).min(main_q.len());
+                                DrawLayer::Image {
+                                    bitmap: Arc::new(ggoled_ticker::render_grid(
+                                        &main_q[start..],
+                                        &compact_q,
+                                        header,
+                                        &ticker_fonts,
+                                        margin,
+                                    )),
+                                    x: 0,
+                                    y: 0,
+                                }
+                            }
                             TickerMode::Scroll => {
                                 let bitmap = Arc::new(ggoled_ticker::render_scroll(&quotes, &ticker_fonts));
                                 let y = (ggoled_ticker::HEIGHT as isize - bitmap.h as isize) / 2;
@@ -1159,6 +1252,10 @@ fn main() {
                 if let Some(id) = ticker_layer.take() {
                     dev.remove_layer(id);
                     ticker_key = None;
+                }
+                if let Some(id) = ticker_header_layer.take() {
+                    dev.remove_layer(id);
+                    ticker_header_text = None;
                 }
                 // Update notifications
                 if notif_layer.is_none() {

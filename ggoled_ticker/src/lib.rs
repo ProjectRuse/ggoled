@@ -5,11 +5,14 @@
 //! stocks like "MSTR" and crypto pairs like "BTC-USD"). It's unofficial, so the
 //! fetching is kept separate from the rendering in case it needs replacing.
 
+pub mod font5x7;
+
 use ggoled_draw::TextRenderer;
 use ggoled_lib::Bitmap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         mpsc::{self, RecvTimeoutError},
@@ -36,11 +39,29 @@ pub enum TickerMode {
     Scroll,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum GridHeader {
+    /// The time (when it's enabled)
+    #[default]
+    Time,
+    /// What's playing, or the time when nothing is
+    Media,
+    None,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct TickerConfig {
     /// Yahoo Finance symbols, e.g. "BTC-USD", "MSTR", "^GSPC"
     pub symbols: Vec<String>,
+    /// Shown together on one row with only their % change in the list layout
+    /// (e.g. indexes); shown like the others in the other layouts.
+    pub compact_symbols: Vec<String>,
+    /// In the list layout, what the top row shows when there's a spare row.
+    pub grid_header: GridHeader,
+    /// Display names, e.g. { "^GSPC" = "S&P" }. Defaults: "-USD" and "^" dropped,
+    /// common indexes named S&P, DOW, NAS.
+    pub labels: BTreeMap<String, String>,
     pub mode: TickerMode,
     /// Seconds per asset (Cycle) or per page (Grid)
     pub cycle_secs: u32,
@@ -52,9 +73,39 @@ impl Default for TickerConfig {
     fn default() -> Self {
         Self {
             symbols: vec!["BTC-USD".into(), "MSTR".into()],
+            compact_symbols: vec!["^GSPC".into(), "^DJI".into(), "^IXIC".into()],
+            grid_header: GridHeader::Time,
+            labels: BTreeMap::new(),
             mode: TickerMode::Cycle,
             cycle_secs: 6,
             refresh_secs: 10,
+        }
+    }
+}
+impl TickerConfig {
+    /// Every symbol to fetch: the main list, then the compact ones (no duplicates).
+    pub fn all_symbols(&self) -> Vec<String> {
+        let mut all = self.symbols.clone();
+        for s in &self.compact_symbols {
+            if !all.contains(s) {
+                all.push(s.clone());
+            }
+        }
+        all
+    }
+    pub fn name_for(&self, symbol: &str) -> String {
+        if let Some(name) = self.labels.get(symbol) {
+            return name.clone();
+        }
+        match symbol {
+            "^GSPC" => "S&P".into(),
+            "^DJI" => "DOW".into(),
+            "^IXIC" => "NAS".into(),
+            "^RUT" => "RUT".into(),
+            _ => {
+                let s = symbol.trim_start_matches('^');
+                s.strip_suffix("-USD").unwrap_or(s).to_string()
+            }
         }
     }
 }
@@ -62,6 +113,8 @@ impl Default for TickerConfig {
 #[derive(Clone, Debug, Default)]
 pub struct Quote {
     pub symbol: String,
+    /// Display name (from the config); empty = derived from the symbol
+    pub name: String,
     pub price: Option<f64>,
     pub prev_close: Option<f64>,
     /// Today's prices, oldest first (for the trend line)
@@ -72,6 +125,9 @@ pub struct Quote {
 impl Quote {
     /// Short name for display: "BTC-USD" -> "BTC", "^GSPC" -> "GSPC"
     pub fn label(&self) -> String {
+        if !self.name.is_empty() {
+            return self.name.clone();
+        }
         let s = self.symbol.trim_start_matches('^');
         let s = s.strip_suffix("-USD").unwrap_or(s);
         s.to_string()
@@ -175,6 +231,7 @@ pub fn fetch_all(agent: &ureq::Agent, symbols: &[String]) -> anyhow::Result<Vec<
             let intraday: Vec<f64> = entry.close.unwrap_or_default().into_iter().flatten().collect();
             quotes.push(Quote {
                 symbol: symbol.clone(),
+                name: String::new(),
                 price: intraday.last().copied(),
                 prev_close: entry.chart_previous_close.or(entry.previous_close),
                 intraday,
@@ -211,6 +268,7 @@ pub fn fetch_quote(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
         .unwrap_or_default();
     Ok(Quote {
         symbol: symbol.to_string(),
+        name: String::new(),
         price: result.meta.regular_market_price,
         prev_close: result.meta.chart_previous_close.or(result.meta.previous_close),
         intraday,
@@ -237,17 +295,29 @@ impl Default for Ticker {
         Self::new(TickerConfig::default())
     }
 }
+/// Quote slots for every configured symbol, keeping existing data where possible.
+fn build_quotes(config: &TickerConfig, old: &[Quote]) -> Vec<Quote> {
+    config
+        .all_symbols()
+        .into_iter()
+        .map(|sym| {
+            let name = config.name_for(&sym);
+            match old.iter().find(|q| q.symbol == sym) {
+                Some(q) => Quote { name, ..q.clone() },
+                None => Quote {
+                    symbol: sym,
+                    name,
+                    ..Default::default()
+                },
+            }
+        })
+        .collect()
+}
+
 impl Ticker {
     pub fn new(config: TickerConfig) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
-            quotes: config
-                .symbols
-                .iter()
-                .map(|s| Quote {
-                    symbol: s.clone(),
-                    ..Default::default()
-                })
-                .collect(),
+            quotes: build_quotes(&config, &[]),
             config,
             generation: 0,
             active: false,
@@ -263,7 +333,7 @@ impl Ticker {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
                     (
-                        s.config.symbols.clone(),
+                        s.config.all_symbols(),
                         s.config.refresh_secs.max(MIN_REFRESH_SECS),
                         s.active,
                     )
@@ -285,7 +355,10 @@ impl Ticker {
                             backoff = Duration::ZERO;
                             for q in s.quotes.iter_mut() {
                                 match new.iter().find(|n| n.symbol == q.symbol) {
-                                    Some(n) => *q = n.clone(),
+                                    Some(n) => {
+                                        let name = std::mem::take(&mut q.name);
+                                        *q = Quote { name, ..n.clone() };
+                                    }
                                     None => q.error = Some("no data".into()),
                                 }
                             }
@@ -341,16 +414,7 @@ impl Ticker {
             return;
         }
         let old = std::mem::take(&mut s.quotes);
-        s.quotes = config
-            .symbols
-            .iter()
-            .map(|sym| {
-                old.iter().find(|q| &q.symbol == sym).cloned().unwrap_or(Quote {
-                    symbol: sym.clone(),
-                    ..Default::default()
-                })
-            })
-            .collect();
+        s.quotes = build_quotes(config, &old);
         s.config = config.clone();
         s.generation += 1;
         drop(s);
@@ -363,8 +427,18 @@ impl Ticker {
         _ = self.wake.send(());
     }
 
+    /// All quotes: the main symbols, then the compact ones.
     pub fn quotes(&self) -> Vec<Quote> {
         self.shared.lock().quotes.clone()
+    }
+    /// (main symbols, compact symbols), for the list layout.
+    pub fn split_quotes(&self) -> (Vec<Quote>, Vec<Quote>) {
+        let s = self.shared.lock();
+        let find = |sym: &String| s.quotes.iter().find(|q| &q.symbol == sym).cloned();
+        (
+            s.config.symbols.iter().filter_map(find).collect(),
+            s.config.compact_symbols.iter().filter_map(find).collect(),
+        )
     }
     pub fn generation(&self) -> u64 {
         self.shared.lock().generation
@@ -476,25 +550,29 @@ fn blit(b: &mut Bitmap, src: &Bitmap, x: isize, y: isize) {
 }
 
 /// One asset filling the screen: label and change on top, big price, trend line.
-pub fn render_cycle(q: &Quote, fonts: &Fonts) -> Bitmap {
+/// `margin` keeps content that many pixels from the left/right edges (for the
+/// OLED shift, which moves the whole image).
+pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
     let mut b = Bitmap::new(WIDTH, HEIGHT, false);
+    let (left, right) = (margin as isize, (WIDTH - margin) as isize);
+    let inner = WIDTH - 2 * margin;
     let label = fonts.small.render_line(&q.display_label());
-    blit(&mut b, &label, 0, -2);
+    blit(&mut b, &label, left, -2);
     if let Some(pct) = q.change_pct() {
         let ch = fonts.small.render_line(&format_change(pct));
-        blit(&mut b, &ch, (WIDTH - ch.w) as isize, -2);
+        blit(&mut b, &ch, right - ch.w as isize, -2);
     }
     match q.price {
         Some(price) => {
             let text = format_price(price);
             let mut big = fonts.big.render_line(&text);
             // very large numbers: drop to the small font rather than clip
-            if big.w > WIDTH {
+            if big.w > inner {
                 big = fonts.small.render_line(&text);
             }
             let y = if big.h > 20 { 10 } else { 20 };
             blit(&mut b, &big, ((WIDTH - big.w.min(WIDTH)) / 2) as isize, y);
-            draw_trend(&mut b, q, 0, 46, WIDTH, 18);
+            draw_trend(&mut b, q, left, 46, inner, 18);
         }
         None => {
             let msg = if q.error.is_some() { "no data" } else { "loading..." };
@@ -506,27 +584,80 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts) -> Bitmap {
 }
 
 pub const GRID_ROWS: usize = 4;
+const ROW_H: usize = HEIGHT / GRID_ROWS;
 
-/// Up to four assets, one per row: label, price, change.
-pub fn render_grid(quotes: &[Quote], fonts: &Fonts) -> Bitmap {
+/// The list layout's top row.
+pub enum Header<'a> {
+    None,
+    /// Centered text in the 16px font
+    Text(&'a str),
+    /// Leave the row empty (the caller draws something there, e.g. scrolling text)
+    Reserved,
+}
+
+/// How the list layout splits into pages: (rows for main symbols per page, pages).
+pub fn grid_pages(main_count: usize, has_compact: bool) -> (usize, usize) {
+    let rows = GRID_ROWS - has_compact as usize;
+    (rows, main_count.div_ceil(rows).max(1))
+}
+
+/// Whether the list layout has a spare row for a header.
+pub fn grid_has_header_room(main_count: usize, has_compact: bool) -> bool {
+    main_count + (has_compact as usize) < GRID_ROWS
+}
+
+/// Assets one per row (label, price, change), then the compact symbols sharing
+/// one row (name above, % change below), with an optional header row on top.
+pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fonts, margin: usize) -> Bitmap {
     let mut b = Bitmap::new(WIDTH, HEIGHT, false);
-    let row_h = HEIGHT / GRID_ROWS;
-    for (row, q) in quotes.iter().take(GRID_ROWS).enumerate() {
-        let y = (row * row_h) as isize - 2;
+    let (left, right) = (margin as isize, (WIDTH - margin) as isize);
+    let mut row = 0;
+    match header {
+        Header::None => {}
+        Header::Text(text) => {
+            let t = fonts.small.render_line(text);
+            let x = if t.w > WIDTH - 2 * margin {
+                left
+            } else {
+                ((WIDTH - t.w) / 2) as isize
+            };
+            blit(&mut b, &t, x, -2);
+            row += 1;
+        }
+        Header::Reserved => row += 1,
+    }
+    let main_rows = GRID_ROWS - row - (!compact.is_empty()) as usize;
+    for q in main.iter().take(main_rows) {
+        let y = (row * ROW_H) as isize - 2;
         let label = fonts.small.render_line(&q.display_label());
-        blit(&mut b, &label, 0, y);
-        let mut right = WIDTH as isize;
+        blit(&mut b, &label, left, y);
+        let mut x_right = right;
         if let Some(pct) = q.change_pct() {
             let ch = fonts.small.render_line(&format_change(pct));
-            right -= ch.w as isize;
-            blit(&mut b, &ch, right, y);
-            right -= 5;
+            x_right -= ch.w as isize;
+            blit(&mut b, &ch, x_right, y);
+            x_right -= 4;
         }
         let price_text = q.price.map(format_price).unwrap_or_else(|| "--".into());
         let price = fonts.small.render_line(&price_text);
-        let px = right - price.w as isize;
-        if px > label.w as isize + 3 {
+        let px = x_right - price.w as isize;
+        if px > left + label.w as isize + 2 {
             blit(&mut b, &price, px, y);
+        }
+        row += 1;
+    }
+    if !compact.is_empty() && row < GRID_ROWS {
+        let cols = compact.len().min(4);
+        let col_w = (WIDTH - 2 * margin) / cols;
+        let y = (row * ROW_H) as isize;
+        for (i, q) in compact.iter().take(cols).enumerate() {
+            let col_x = left + (i * col_w) as isize;
+            let center = |w: usize| col_x + (col_w as isize - w as isize) / 2;
+            let name = font5x7::render(&q.display_label());
+            blit(&mut b, &name, center(name.w), y);
+            let value = q.change_pct().map(format_change).unwrap_or_else(|| "--".into());
+            let v = font5x7::render(&value);
+            blit(&mut b, &v, center(v.w), y + font5x7::GLYPH_H as isize + 1);
         }
     }
     b
@@ -595,10 +726,11 @@ mod tests {
         };
         let empty = Quote::default();
         for quote in [&q, &empty] {
-            let b = render_cycle(quote, &fonts);
+            let b = render_cycle(quote, &fonts, 4);
             assert_eq!((b.w, b.h), (WIDTH, HEIGHT));
         }
-        let b = render_grid(&[q.clone(), empty.clone(), q.clone(), q.clone(), q.clone()], &fonts);
+        let many = [q.clone(), empty.clone(), q.clone(), q.clone(), q.clone()];
+        let b = render_grid(&many, &many[..3], Header::Text("12:00:00"), &fonts, 4);
         assert_eq!((b.w, b.h), (WIDTH, HEIGHT));
         assert!(render_scroll(&[q, empty], &fonts).w > WIDTH);
     }

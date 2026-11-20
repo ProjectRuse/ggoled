@@ -27,31 +27,34 @@ fn main() {
         .user_agent("Mozilla/5.0 (ggoled)")
         .build()
         .into();
-    let quotes: Vec<Quote> = args[2..]
-        .iter()
-        .map(|s| {
-            fetch_quote(&agent, s).unwrap_or_else(|e| Quote {
-                symbol: s.clone(),
-                error: Some(e.to_string()),
-                ..Default::default()
-            })
-        })
-        .collect();
-    for q in &quotes {
-        println!(
-            "{}: {:?} prev {:?} pts {} err {:?}",
-            q.symbol,
-            q.price,
-            q.prev_close,
-            q.intraday.len(),
-            q.error
+    let cfg = TickerConfig {
+        symbols: args[2..].to_vec(),
+        ..Default::default()
+    };
+    let fetched = fetch_all(&agent, &cfg.all_symbols()).unwrap();
+    let get = |sym: &String| {
+        let mut q = fetched.iter().find(|q| &q.symbol == sym).cloned().unwrap_or_default();
+        q.name = cfg.name_for(sym);
+        q
+    };
+    let main: Vec<Quote> = cfg.symbols.iter().map(get).collect();
+    let compact: Vec<Quote> = cfg.compact_symbols.iter().map(get).collect();
+    let fonts = Fonts::default();
+    for margin in [0, 4] {
+        for q in &main {
+            save(
+                &render_cycle(q, &fonts, margin),
+                &format!("{out}/cycle_{}_m{margin}.png", q.label()),
+                128,
+            );
+        }
+        save(
+            &render_grid(&main, &compact, Header::Text("12:55:03"), &fonts, margin),
+            &format!("{out}/grid_m{margin}.png"),
+            128,
         );
     }
-    let fonts = Fonts::default();
-    for q in &quotes {
-        save(&render_cycle(q, &fonts), &format!("{out}/cycle_{}.png", q.label()), 128);
-    }
-    save(&render_grid(&quotes, &fonts), &format!("{out}/grid.png"), 128);
-    let s = render_scroll(&quotes, &fonts);
+    let all: Vec<Quote> = main.iter().chain(&compact).cloned().collect();
+    let s = render_scroll(&all, &fonts);
     save(&s, &format!("{out}/scroll_full.png"), s.w);
 }

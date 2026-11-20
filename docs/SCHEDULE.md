@@ -72,6 +72,12 @@ splits, set `weekend_days` in the config file, e.g. `weekend_days = "fri,sat,sun
 
 When entries share a name, the tray adds their days, e.g. "Day (Mon–Thu)".
 
+## Changing the display by hand
+
+If the current entry sets `display`, choosing a different one from the tray's
+**Display** menu overrides it until the next entry starts; then the schedule
+takes over again. The status line shows "display set manually" meanwhile.
+
 ## Holding an entry
 
 **Schedule → Hold: <name>** keeps that entry in effect until the next entry
