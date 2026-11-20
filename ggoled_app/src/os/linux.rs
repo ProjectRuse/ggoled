@@ -1,4 +1,4 @@
-use super::{Media, OSFeatures};
+use super::{DEFAULT_IDLE_TIMEOUT_MS, Media, OSFeatures};
 use mpris::{PlaybackStatus, PlayerFinder};
 
 mod wayland;
@@ -7,6 +7,7 @@ use wayland::IdleTracker;
 pub struct OSImpl {
     pf: Option<PlayerFinder>,
     idle_tracker: Option<IdleTracker>,
+    idle_timeout_ms: u32,
 }
 impl OSFeatures for OSImpl {
     fn new() -> Self {
@@ -17,11 +18,15 @@ impl OSFeatures for OSImpl {
                 None
             }
         };
-        let idle_tracker = IdleTracker::new();
+        let idle_tracker = IdleTracker::new(DEFAULT_IDLE_TIMEOUT_MS);
         if idle_tracker.is_none() {
             eprintln!("failed to init wayland idle tracker");
         }
-        Self { pf, idle_tracker }
+        Self {
+            pf,
+            idle_tracker,
+            idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
+        }
     }
 
     fn supports_media(&self) -> bool {
@@ -58,6 +63,13 @@ impl OSFeatures for OSImpl {
                 self.idle_tracker = None;
                 false
             }
+        }
+    }
+    fn set_idle_timeout(&mut self, ms: u32) {
+        // Wayland idle notifications have a fixed timeout, so recreate the tracker.
+        if ms != self.idle_timeout_ms {
+            self.idle_timeout_ms = ms;
+            self.idle_tracker = IdleTracker::new(ms);
         }
     }
 }

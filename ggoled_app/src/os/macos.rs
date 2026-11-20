@@ -34,4 +34,7 @@ impl OSFeatures for OSImpl {
         // TODO
         false
     }
+    fn set_idle_timeout(&mut self, _ms: u32) {
+        // TODO
+    }
 }

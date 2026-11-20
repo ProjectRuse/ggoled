@@ -76,6 +76,10 @@ struct Config {
     time_mode: ConfigTimeMode,
     show_media: bool,
     idle_timeout: bool,
+    /// Seconds without keyboard/mouse input before the screensaver blanks the OLED.
+    idle_timeout_secs: u32,
+    /// Seconds to leave the SteelSeries volume screen up after a volume change (0 = off).
+    volume_overlay_secs: u32,
     oled_shift: ConfigShiftMode,
     status_notify: StatusNotifyMode,
     quit_mode: ConfigQuitMode,
@@ -87,6 +91,8 @@ impl Default for Config {
             time_mode: ConfigTimeMode::default(),
             show_media: true,
             idle_timeout: true,
+            idle_timeout_secs: 60,
+            volume_overlay_secs: 3,
             oled_shift: ConfigShiftMode::default(),
             status_notify: StatusNotifyMode::default(),
             quit_mode: ConfigQuitMode::default(),
@@ -190,6 +196,8 @@ enum MenuEvent {
     SetShiftMode(ConfigShiftMode),
     SetStatusNotifyMode(StatusNotifyMode),
     SetQuitMode(ConfigQuitMode),
+    SetIdleDelay(u32),
+    SetVolumeOverlay(u32),
     Quit,
 }
 
@@ -305,6 +313,40 @@ fn main() {
         }
     }
 
+    let tm_idle_delay_radio = RadioMenu::new(
+        menu,
+        c"Screensaver delay",
+        &[
+            (c"30 seconds", 30),
+            (c"1 minute", 60),
+            (c"2 minutes", 120),
+            (c"5 minutes", 300),
+            (c"10 minutes", 600),
+            (c"15 minutes", 900),
+            (c"30 minutes", 1800),
+            (c"1 hour", 3600),
+        ],
+        config.idle_timeout_secs,
+        &menu_tx,
+        MenuEvent::SetIdleDelay,
+    );
+    os.set_idle_timeout(config.idle_timeout_secs.saturating_mul(1000));
+
+    let tm_volume_radio = RadioMenu::new(
+        menu,
+        c"Show volume screen for",
+        &[
+            (c"Off", 0),
+            (c"2 seconds", 2),
+            (c"3 seconds", 3),
+            (c"5 seconds", 5),
+            (c"10 seconds", 10),
+        ],
+        config.volume_overlay_secs,
+        &menu_tx,
+        MenuEvent::SetVolumeOverlay,
+    );
+
     let tm_shift_radio = RadioMenu::new(
         menu,
         c"OLED screen shift",
@@ -379,6 +421,10 @@ fn main() {
     let mut notif_layer: Option<LayerId> = None;
     let mut notif_expiry = Local::now();
     let mut is_connected = false;
+    let mut last_volume: Option<u8> = None;
+    let mut volume_hold_until = Instant::now();
+    let mut screensaver_active = false;
+    let mut stock_ui = false;
 
     // Wait for connect
     let mut last_connect = Instant::now() - Duration::from_secs(1);
@@ -454,6 +500,17 @@ fn main() {
                     config.quit_mode = mode;
                     tm_quit_mode_radio.update_checked(mode);
                 }
+                MenuEvent::SetIdleDelay(secs) => {
+                    config_updated = true;
+                    config.idle_timeout_secs = secs;
+                    tm_idle_delay_radio.update_checked(secs);
+                    os.set_idle_timeout(secs.saturating_mul(1000));
+                }
+                MenuEvent::SetVolumeOverlay(secs) => {
+                    config_updated = true;
+                    config.volume_overlay_secs = secs;
+                    tm_volume_radio.update_checked(secs);
+                }
                 MenuEvent::Quit => break 'main,
             }
         }
@@ -489,6 +546,17 @@ fn main() {
                             force_redraw = true;
                         }
                     }
+                    ggoled_lib::DeviceEvent::Volume { volume } => {
+                        // The first reading comes from our own probe at startup/reconnect;
+                        // only react to actual changes.
+                        if let Some(prev) = last_volume
+                            && prev != volume
+                            && config.volume_overlay_secs > 0
+                        {
+                            volume_hold_until = Instant::now() + Duration::from_secs(config.volume_overlay_secs as u64);
+                        }
+                        last_volume = Some(volume);
+                    }
                     _ => {}
                 },
             }
@@ -508,7 +576,8 @@ fn main() {
             }
 
             // Check if idle
-            if config.idle_timeout && os.is_idle() {
+            screensaver_active = config.idle_timeout && os.is_idle();
+            if screensaver_active {
                 dev.clear_layers(); // clear screen when idle
                 notif_layer = None;
                 last_media = None; // reset media so we check again when not idle
@@ -555,6 +624,16 @@ fn main() {
 
                 dev.play();
             }
+        }
+
+        // Decide who owns the screen: us, or the SteelSeries UI.
+        // - Right after a volume change, let the stock volume screen show.
+        // - If we have nothing to draw (and aren't blanking for the screensaver),
+        //   hand the screen back instead of drawing an empty black frame over it.
+        let want_stock = Instant::now() < volume_hold_until || (!screensaver_active && dev.layer_count() == 0);
+        if want_stock != stock_ui {
+            stock_ui = want_stock;
+            dev.set_stock_ui(want_stock);
         }
 
         sleep(Duration::from_millis(10));

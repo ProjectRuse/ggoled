@@ -1,4 +1,3 @@
-use crate::os::IDLE_TIMEOUT_MS;
 use std::{collections::HashMap, io::ErrorKind};
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
@@ -17,6 +16,7 @@ type SeatEntry = (ExtIdleNotificationV1, bool);
 
 struct IdleState {
     notifier: ExtIdleNotifierV1,
+    timeout_ms: u32,
     seats: HashMap<u32, SeatEntry>,
 }
 
@@ -28,9 +28,9 @@ impl IdleState {
         let seat = registry.bind::<wl_seat::WlSeat, _, _>(name, 1, qh, ());
         let notification = if self.notifier.version() >= 2 {
             self.notifier
-                .get_input_idle_notification(IDLE_TIMEOUT_MS, &seat, qh, name)
+                .get_input_idle_notification(self.timeout_ms, &seat, qh, name)
         } else {
-            self.notifier.get_idle_notification(IDLE_TIMEOUT_MS, &seat, qh, name)
+            self.notifier.get_idle_notification(self.timeout_ms, &seat, qh, name)
         };
         self.seats.insert(name, (notification, false));
     }
@@ -97,7 +97,7 @@ fn wayland_err(e: impl ToString) -> String {
 }
 
 impl IdleTracker {
-    pub fn new() -> Option<Self> {
+    pub fn new(timeout_ms: u32) -> Option<Self> {
         let conn = Connection::connect_to_env().ok()?;
         let (globals, mut queue) = registry_queue_init::<IdleState>(&conn).ok()?;
         let qh = queue.handle();
@@ -105,6 +105,7 @@ impl IdleTracker {
         let registry = globals.registry().clone();
         let mut state = IdleState {
             notifier,
+            timeout_ms,
             seats: HashMap::new(),
         };
         globals.contents().with_list(|globals| {

@@ -170,6 +170,9 @@ enum DrawCommand {
     SetShiftMode(ShiftMode),
     Stop,
     Probe,
+    /// true: hand the screen to the SteelSeries UI and stop drawing.
+    /// false: take the screen back and resume drawing.
+    StockUi(bool),
 }
 
 #[derive(Debug)]
@@ -235,6 +238,7 @@ fn run_draw_device_thread(
     let frame_delay = Duration::from_nanos(1_000_000_000 / fps as u64);
     let mut prev_screen = Bitmap::new(0, 0, false);
     let mut playing = false;
+    let mut stock_ui = false;
     let shift_pos_low = square_shift_calc(1);
     let shift_pos_high = square_shift_calc(4);
     let mut shift_idx_low = 0;
@@ -254,6 +258,16 @@ fn run_draw_device_thread(
                 DrawCommand::SetShiftMode(mode) => shift_mode = mode,
                 DrawCommand::Stop => stop_after_frame = true,
                 DrawCommand::Probe => _ = dev.probe(),
+                DrawCommand::StockUi(on) => {
+                    if on && !stock_ui {
+                        _ = dev.return_to_ui();
+                    }
+                    if !on && stock_ui {
+                        // force a full redraw when we take the screen back
+                        prev_screen = Bitmap::new(0, 0, false);
+                    }
+                    stock_ui = on;
+                }
             }
         }
 
@@ -267,7 +281,7 @@ fn run_draw_device_thread(
         }
 
         // Render frame
-        if connected && playing {
+        if connected && playing && !stock_ui {
             // Handle OLED shifts
             let (shift_x, shift_y) = match shift_mode {
                 ShiftMode::Off => (0, 0),
@@ -501,6 +515,13 @@ impl DrawDevice {
     }
     pub fn pause(&mut self) {
         self.cmd_sender.send(DrawCommand::Pause).unwrap();
+    }
+    /// Hand the screen to the SteelSeries UI (true) or take it back (false).
+    pub fn set_stock_ui(&mut self, on: bool) {
+        _ = self.cmd_sender.send(DrawCommand::StockUi(on));
+    }
+    pub fn layer_count(&self) -> usize {
+        self.layers.lock().len()
     }
     pub fn probe(&mut self) {
         self.cmd_sender.send(DrawCommand::Probe).unwrap();

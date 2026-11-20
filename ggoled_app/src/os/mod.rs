@@ -1,4 +1,4 @@
-pub const IDLE_TIMEOUT_MS: u32 = 60_000;
+pub const DEFAULT_IDLE_TIMEOUT_MS: u32 = 60_000;
 
 #[derive(PartialEq)]
 pub struct Media {
@@ -16,6 +16,8 @@ pub trait OSFeatures {
 
     fn supports_idle(&self) -> bool;
     fn is_idle(&mut self) -> bool;
+    /// Change how long without keyboard/mouse input counts as idle.
+    fn set_idle_timeout(&mut self, ms: u32);
 }
 
 #[cfg(target_os = "windows")]
