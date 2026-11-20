@@ -81,6 +81,19 @@ If the current entry sets `display`, choosing a different one from the tray's
 **Display** menu overrides it until the next entry starts; then the schedule
 takes over again. The status line shows "display set manually" meanwhile.
 
+## While the PC is locked
+
+Settings → Schedule → **When this PC is locked**: pick an entry (e.g. Night)
+to use whenever the PC is locked. It applies 5 seconds after locking (a UAC
+prompt also briefly looks like a lock, so short ones are ignored) and
+everything returns to normal on unlock; a hold you had stays. The tray shows
+"Locked: Night" meanwhile. Windows only for now.
+
+```toml
+lock_entry = "Night"
+lock_scarlett = true   # also its Scarlett LED timeout (audio drops briefly after unlocking)
+```
+
 ## Holding an entry
 
 **Schedule → Hold: <name>** keeps that entry in effect until the next entry

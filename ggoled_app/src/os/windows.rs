@@ -5,6 +5,9 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 };
 use windows_sys::Win32::{
+    System::StationsAndDesktops::{
+        CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
+    },
     System::SystemInformation::GetTickCount,
     UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
 };
@@ -73,5 +76,29 @@ impl OSFeatures for OSImpl {
     }
     fn set_idle_timeout(&mut self, ms: u32) {
         self.idle_timeout_ms = ms;
+    }
+    fn is_locked(&mut self) -> bool {
+        // While locked, input goes to the lock screen's desktop, which normal
+        // programs can't open. Unlocked, the input desktop is "Default".
+        unsafe {
+            let desk = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);
+            if desk.is_null() {
+                return true;
+            }
+            let mut name = [0u16; 64];
+            let ok = GetUserObjectInformationW(
+                desk,
+                UOI_NAME,
+                name.as_mut_ptr().cast(),
+                (name.len() * 2) as u32,
+                std::ptr::null_mut(),
+            );
+            CloseDesktop(desk);
+            if ok == 0 {
+                return false; // can't tell; assume unlocked
+            }
+            let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+            !String::from_utf16_lossy(&name[..len]).eq_ignore_ascii_case("Default")
+        }
     }
 }

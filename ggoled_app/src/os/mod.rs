@@ -18,6 +18,10 @@ pub trait OSFeatures {
     fn is_idle(&mut self) -> bool;
     /// Change how long without keyboard/mouse input counts as idle.
     fn set_idle_timeout(&mut self, ms: u32);
+    /// Whether the session is locked (lock screen showing).
+    fn is_locked(&mut self) -> bool {
+        false
+    }
 }
 
 #[cfg(target_os = "windows")]

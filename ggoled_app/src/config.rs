@@ -78,6 +78,11 @@ pub struct Config {
     /// e.g. "sat-sun", "fri-sun", or "fri,sat,sun".
     pub weekend_days: String,
     pub scarlett: ScarlettConfig,
+    /// Name of a schedule entry to use while the PC is locked (empty = none).
+    pub lock_entry: String,
+    /// Whether that entry's Scarlett LED timeout applies too (changing it briefly
+    /// interrupts the Scarlett's audio, e.g. right after unlocking).
+    pub lock_scarlett: bool,
     // Skipped when empty: "schedule = []" would clash with [[schedule]] entries
     // added to the file later.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -124,6 +129,8 @@ impl Default for Config {
             schedule_enabled: false,
             weekend_days: "sat-sun".into(),
             scarlett: ScarlettConfig::default(),
+            lock_entry: String::new(),
+            lock_scarlett: true,
             schedule: vec![],
         }
     }
@@ -156,6 +163,20 @@ impl Config {
     /// Check the parts serde can't (schedule times, days, weekend setting).
     pub fn validate(&self) -> Result<Vec<Timing>, String> {
         let weekend = schedule::parse_weekend(&self.weekend_days)?;
-        schedule::parse(&self.schedule, weekend)
+        let timings = schedule::parse(&self.schedule, weekend)?;
+        if !self.lock_entry.is_empty() && self.lock_entry_index().is_none() {
+            return Err(format!(
+                "lock_entry: there's no schedule entry named \"{}\"",
+                self.lock_entry
+            ));
+        }
+        Ok(timings)
+    }
+    /// The schedule entry to use while locked, if set (first entry with that name).
+    pub fn lock_entry_index(&self) -> Option<usize> {
+        if self.lock_entry.is_empty() {
+            return None;
+        }
+        self.schedule.iter().position(|s| s.name == self.lock_entry)
     }
 }

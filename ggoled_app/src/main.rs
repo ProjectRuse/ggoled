@@ -630,6 +630,7 @@ fn main() {
     let mut display_override: Option<(DisplayMode, Option<DateTime<Local>>)> = None;
     let mut shown_display: Option<DisplayMode> = None;
     let mut settings_child: Option<std::process::Child> = None;
+    let mut locked_since: Option<Instant> = None;
     let mut config_mtime = config_file_mtime();
     let mut last_config_check = Instant::now();
     let mut eff = Effective::new(&config, None);
@@ -925,10 +926,21 @@ fn main() {
                     unsafe { sdl::SDL_SetTrayEntryChecked(*entry, false) };
                 }
             }
-            let active_idx = match hold {
-                Some((i, _)) => Some(i),
-                None if config.schedule_enabled => schedule::active(&timings, time),
-                None => None,
+            // Locked PC: use the chosen entry, after 5 s (a UAC prompt also briefly
+            // looks locked). Unlocking takes effect immediately.
+            let lock_idx = config.lock_entry_index();
+            if lock_idx.is_some() && os.is_locked() {
+                locked_since.get_or_insert_with(Instant::now);
+            } else {
+                locked_since = None;
+            }
+            let locked = locked_since.is_some_and(|t| t.elapsed() >= Duration::from_secs(5));
+
+            let active_idx = match (locked, hold) {
+                (true, _) => lock_idx,
+                (false, Some((i, _))) => Some(i),
+                (false, None) if config.schedule_enabled => schedule::active(&timings, time),
+                (false, None) => None,
             };
             if let Some((_, Some(until))) = display_override
                 && time >= until
@@ -936,8 +948,13 @@ fn main() {
                 display_override = None;
             }
             eff = Effective::new(&config, active_idx.and_then(|i| config.schedule.get(i)));
-            if let Some((display, _)) = display_override {
+            if let Some((display, _)) = display_override
+                && !locked
+            {
                 eff.display = display;
+            }
+            if locked && !config.lock_scarlett {
+                eff.scarlett_led_timeout = None; // leave the Scarlett as it is
             }
             if last_active != Some(active_idx) {
                 last_active = Some(active_idx);
@@ -957,6 +974,10 @@ fn main() {
                 None => "until ended".to_string(),
             };
             let status = match (hold, active_idx) {
+                _ if locked => format!(
+                    "Locked: {}",
+                    segment_label(&config.schedule, &timings, active_idx.unwrap_or(0))
+                ),
                 (Some((i, until)), _) => {
                     format!(
                         "Holding: {} ({})",
@@ -973,8 +994,8 @@ fn main() {
                 (None, None) => "Schedule: off".to_string(),
             };
             let status = match display_override {
-                Some(_) => format!("{status} · display set manually"),
-                None => status,
+                Some(_) if !locked => format!("{status} · display set manually"),
+                _ => status,
             };
             // Keep the Display menu showing what's actually on screen
             if shown_display != Some(eff.display) {

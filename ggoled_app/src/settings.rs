@@ -726,7 +726,41 @@ fn schedule_tab(ui: &mut Ui, c: &mut Config) {
         ));
     }
 
+    heading(ui, "When this PC is locked");
+    let mut names: Vec<String> = vec![];
+    for seg in &c.schedule {
+        if !seg.name.is_empty() && !names.contains(&seg.name) {
+            names.push(seg.name.clone());
+        }
+    }
+    ui.horizontal(|ui| {
+        ui.label("Use");
+        egui::ComboBox::from_id_salt("lock_entry")
+            .selected_text(if c.lock_entry.is_empty() {
+                "the schedule as usual".to_string()
+            } else {
+                c.lock_entry.clone()
+            })
+            .width(190.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut c.lock_entry, String::new(), "the schedule as usual");
+                for name in &names {
+                    ui.selectable_value(&mut c.lock_entry, name.clone(), name);
+                }
+            });
+        ui.label("while locked");
+    });
+    ui.add_enabled_ui(!c.lock_entry.is_empty(), |ui| {
+        ui.checkbox(&mut c.lock_scarlett, "Include its Scarlett LED timeout");
+    });
+    hint(
+        ui,
+        "Applies 5 seconds after locking, and everything returns to normal when you unlock (a hold stays). \
+         With the Scarlett included, its audio drops out for a few seconds after you unlock while the timeout changes back.",
+    );
+
     let weekend = schedule::parse_weekend(&c.weekend_days).unwrap_or(schedule::SAT_SUN);
+    let lock_entry = &mut c.lock_entry;
     let mut action: Option<(usize, i32)> = None; // -1 up, +1 down, 0 delete, 2 duplicate
     let n = c.schedule.len();
     for (i, seg) in c.schedule.iter_mut().enumerate() {
@@ -734,11 +768,19 @@ fn schedule_tab(ui: &mut Ui, c: &mut Config) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut seg.name)
-                        .hint_text("Name")
-                        .desired_width(140.0),
-                );
+                let old_name = seg.name.clone();
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut seg.name)
+                            .hint_text("Name")
+                            .desired_width(140.0),
+                    )
+                    .changed()
+                    && !old_name.is_empty()
+                    && *lock_entry == old_name
+                {
+                    *lock_entry = seg.name.clone(); // keep the lock setting pointing at it
+                }
                 ui.label("starts at");
                 time_editor(ui, &mut seg.start);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -792,7 +834,10 @@ fn schedule_tab(ui: &mut Ui, c: &mut Config) {
     }
     match action {
         Some((i, 0)) => {
-            c.schedule.remove(i);
+            let removed = c.schedule.remove(i);
+            if removed.name == c.lock_entry && !c.schedule.iter().any(|s| s.name == removed.name) {
+                c.lock_entry.clear();
+            }
         }
         Some((i, 2)) => {
             let copy = c.schedule[i].clone();
