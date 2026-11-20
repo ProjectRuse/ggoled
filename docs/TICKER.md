@@ -22,14 +22,18 @@ file), then Schedule → Reload config.
 symbols = ["BTC-USD", "MSTR"]
 mode = "Cycle"        # "Cycle", "Grid" or "Scroll"
 cycle_secs = 6        # per asset / page
-refresh_secs = 60     # minimum 15
+refresh_secs = 10     # minimum 5
 ```
 
 Symbols are Yahoo Finance symbols: stocks and ETFs as-is (`MSTR`, `SPY`),
 crypto as pairs (`BTC-USD`, `ETH-USD`), indexes with `^` (`^GSPC`). The
 display drops `-USD` and `^`. Look a symbol up on finance.yahoo.com if unsure.
 
-Prices are only fetched while the ticker is on screen. Today's change is
+Prices are fetched in a single request for all symbols, only while the ticker is
+on screen. In the one-at-a-time layout they're also refreshed a second before
+each switch, so every asset appears with a current price. If Yahoo starts
+refusing requests, the ticker backs off automatically, and a price more than
+two minutes old gets a `?` after its symbol. Today's change is
 measured from the previous close (for crypto, roughly since midnight UTC).
 Stock prices follow regular trading hours only (no pre/after-market moves),
 and some exchanges' data may be delayed.

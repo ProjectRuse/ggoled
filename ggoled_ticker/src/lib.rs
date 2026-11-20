@@ -18,6 +18,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub const MIN_REFRESH_SECS: u32 = 5;
+/// Data older than this gets a "?" after its label.
+const STALE_AFTER: Duration = Duration::from_secs(120);
+
 pub const WIDTH: usize = 128;
 pub const HEIGHT: usize = 64;
 
@@ -40,7 +44,8 @@ pub struct TickerConfig {
     pub mode: TickerMode,
     /// Seconds per asset (Cycle) or per page (Grid)
     pub cycle_secs: u32,
-    /// Seconds between price updates
+    /// Seconds between price updates (minimum 5). In the one-at-a-time layout
+    /// prices are also refreshed just before each switch.
     pub refresh_secs: u32,
 }
 impl Default for TickerConfig {
@@ -49,7 +54,7 @@ impl Default for TickerConfig {
             symbols: vec!["BTC-USD".into(), "MSTR".into()],
             mode: TickerMode::Cycle,
             cycle_secs: 6,
-            refresh_secs: 60,
+            refresh_secs: 10,
         }
     }
 }
@@ -70,6 +75,11 @@ impl Quote {
         let s = self.symbol.trim_start_matches('^');
         let s = s.strip_suffix("-USD").unwrap_or(s);
         s.to_string()
+    }
+    /// Label with "?" appended when the price is old (e.g. connection or rate-limit trouble).
+    pub fn display_label(&self) -> String {
+        let stale = self.price.is_some() && self.updated.is_none_or(|t| t.elapsed() > STALE_AFTER);
+        if stale { self.label() + "?" } else { self.label() }
     }
     pub fn change_pct(&self) -> Option<f64> {
         match (self.price, self.prev_close) {
@@ -120,12 +130,68 @@ fn agent() -> ureq::Agent {
         .into()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SparkEntry {
+    close: Option<Vec<Option<f64>>>,
+    chart_previous_close: Option<f64>,
+    previous_close: Option<f64>,
+}
+
+#[derive(Debug)]
+pub struct RateLimited;
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "rate limited by Yahoo")
+    }
+}
+impl std::error::Error for RateLimited {}
+
+fn get(agent: &ureq::Agent, url: &str) -> anyhow::Result<String> {
+    // Yahoo's responses are cacheable for ~45 s; ask for fresh data, and make the
+    // URL unique so no cache along the way can answer with an old copy.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let url = format!("{url}&_={nonce}");
+    match agent.get(&url).header("Cache-Control", "no-cache").call() {
+        Ok(mut resp) => Ok(resp.body_mut().read_to_string()?),
+        Err(ureq::Error::StatusCode(429)) => Err(RateLimited.into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// All symbols in one request (Yahoo's "spark" endpoint). Symbols Yahoo doesn't
+/// know are simply missing from the result.
+pub fn fetch_all(agent: &ureq::Agent, symbols: &[String]) -> anyhow::Result<Vec<Quote>> {
+    let mut quotes = vec![];
+    for chunk in symbols.chunks(20) {
+        let list = chunk.join(",").replace('^', "%5E");
+        let url = format!("https://query1.finance.yahoo.com/v8/finance/spark?symbols={list}&range=1d&interval=5m");
+        let mut map: std::collections::HashMap<String, SparkEntry> = serde_json::from_str(&get(agent, &url)?)?;
+        for symbol in chunk {
+            let Some(entry) = map.remove(symbol) else { continue };
+            let intraday: Vec<f64> = entry.close.unwrap_or_default().into_iter().flatten().collect();
+            quotes.push(Quote {
+                symbol: symbol.clone(),
+                price: intraday.last().copied(),
+                prev_close: entry.chart_previous_close.or(entry.previous_close),
+                intraday,
+                updated: Some(Instant::now()),
+                error: None,
+            });
+        }
+    }
+    Ok(quotes)
+}
+
 pub fn fetch_quote(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=5m",
         symbol.replace('^', "%5E")
     );
-    let body = agent.get(&url).call()?.body_mut().read_to_string()?;
+    let body = get(agent, &url)?;
     let resp: ChartResponse = serde_json::from_str(&body)?;
     if let Some(err) = resp.chart.error
         && !err.is_null()
@@ -190,27 +256,66 @@ impl Ticker {
         let thread_shared = shared.clone();
         thread::spawn(move || {
             let agent = agent();
+            let mut last_fetch: Option<Instant> = None;
+            let mut backoff = Duration::ZERO;
+            let mut pending = false;
             loop {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
-                    (s.config.symbols.clone(), s.config.refresh_secs.max(15), s.active)
+                    (
+                        s.config.symbols.clone(),
+                        s.config.refresh_secs.max(MIN_REFRESH_SECS),
+                        s.active,
+                    )
                 };
-                if active {
-                    for symbol in &symbols {
-                        let result = fetch_quote(&agent, symbol);
-                        let mut s = thread_shared.lock();
-                        // the symbol list may have changed while we were fetching
-                        if let Some(q) = s.quotes.iter_mut().find(|q| &q.symbol == symbol) {
-                            match result {
-                                Ok(new) => *q = new,
-                                Err(e) => q.error = Some(e.to_string()),
+                let min_gap = Duration::from_secs(MIN_REFRESH_SECS as u64).max(backoff);
+                let due = last_fetch.is_none_or(|t| t.elapsed() >= min_gap);
+                if active && due && !symbols.is_empty() {
+                    last_fetch = Some(Instant::now());
+                    pending = false;
+                    // one request for everything; per-symbol requests only as a fallback
+                    let result = match fetch_all(&agent, &symbols) {
+                        Err(e) if e.is::<RateLimited>() => Err(e),
+                        Err(_) => Ok(symbols.iter().filter_map(|s| fetch_quote(&agent, s).ok()).collect()),
+                        ok => ok,
+                    };
+                    let mut s = thread_shared.lock();
+                    match result {
+                        Ok(new) => {
+                            backoff = Duration::ZERO;
+                            for q in s.quotes.iter_mut() {
+                                match new.iter().find(|n| n.symbol == q.symbol) {
+                                    Some(n) => *q = n.clone(),
+                                    None => q.error = Some("no data".into()),
+                                }
                             }
-                            s.generation += 1;
+                        }
+                        Err(e) => {
+                            if e.is::<RateLimited>() {
+                                backoff = (backoff * 2).clamp(Duration::from_secs(60), Duration::from_secs(600));
+                            }
+                            for q in s.quotes.iter_mut() {
+                                q.error = Some(e.to_string());
+                            }
                         }
                     }
+                    s.generation += 1;
                 }
-                match wake_rx.recv_timeout(Duration::from_secs(refresh as u64)) {
-                    Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+                // Sleep until the next refresh, or until woken (refresh request, config
+                // change, ticker shown). A request that arrives too soon after the last
+                // fetch is kept and served as soon as the minimum gap has passed.
+                let interval = if pending {
+                    min_gap
+                } else {
+                    Duration::from_secs(refresh as u64).max(backoff)
+                };
+                let wait = match last_fetch {
+                    Some(t) => interval.saturating_sub(t.elapsed()).max(Duration::from_millis(200)),
+                    None => interval,
+                };
+                match wake_rx.recv_timeout(wait) {
+                    Ok(()) => pending = true,
+                    Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -252,6 +357,12 @@ impl Ticker {
         _ = self.wake.send(());
     }
 
+    /// Fetch now if allowed (at most every MIN_REFRESH_SECS, longer if Yahoo is
+    /// rate limiting).
+    pub fn request_refresh(&self) {
+        _ = self.wake.send(());
+    }
+
     pub fn quotes(&self) -> Vec<Quote> {
         self.shared.lock().quotes.clone()
     }
@@ -267,7 +378,7 @@ fn with_commas(int_part: u64) -> String {
     let digits = int_part.to_string();
     let mut out = String::new();
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -367,7 +478,7 @@ fn blit(b: &mut Bitmap, src: &Bitmap, x: isize, y: isize) {
 /// One asset filling the screen: label and change on top, big price, trend line.
 pub fn render_cycle(q: &Quote, fonts: &Fonts) -> Bitmap {
     let mut b = Bitmap::new(WIDTH, HEIGHT, false);
-    let label = fonts.small.render_line(&q.label());
+    let label = fonts.small.render_line(&q.display_label());
     blit(&mut b, &label, 0, -2);
     if let Some(pct) = q.change_pct() {
         let ch = fonts.small.render_line(&format_change(pct));
@@ -402,7 +513,7 @@ pub fn render_grid(quotes: &[Quote], fonts: &Fonts) -> Bitmap {
     let row_h = HEIGHT / GRID_ROWS;
     for (row, q) in quotes.iter().take(GRID_ROWS).enumerate() {
         let y = (row * row_h) as isize - 2;
-        let label = fonts.small.render_line(&q.label());
+        let label = fonts.small.render_line(&q.display_label());
         blit(&mut b, &label, 0, y);
         let mut right = WIDTH as isize;
         if let Some(pct) = q.change_pct() {
@@ -432,7 +543,7 @@ pub fn scroll_text(quotes: &[Quote]) -> String {
     quotes
         .iter()
         .map(|q| {
-            let mut s = q.label();
+            let mut s = q.display_label();
             s += " ";
             s += &q.price.map(format_price).unwrap_or_else(|| "--".into());
             if let Some(pct) = q.change_pct() {

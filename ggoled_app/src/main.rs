@@ -769,6 +769,7 @@ fn main() {
     let ticker_fonts = ggoled_ticker::Fonts::default();
     let mut ticker_layer: Option<LayerId> = None;
     let mut ticker_key: Option<(u64, TickerMode, usize)> = None;
+    let mut ticker_prefetched: Option<i64> = None;
 
     // Wait for connect
     let mut last_connect = Instant::now() - Duration::from_secs(1);
@@ -1093,6 +1094,16 @@ fn main() {
 
                 let quotes = ticker.quotes();
                 let tcfg = &config.ticker;
+                // One at a time: refresh a second before each switch, so every asset
+                // appears with a current price
+                let cycle = tcfg.cycle_secs.max(1) as i64;
+                if tcfg.mode == TickerMode::Cycle && cycle >= 2 {
+                    let next_step = (time.timestamp() + 1) / cycle;
+                    if (time.timestamp() + 1) % cycle == 0 && ticker_prefetched != Some(next_step) {
+                        ticker_prefetched = Some(next_step);
+                        ticker.request_refresh();
+                    }
+                }
                 let step = time.timestamp().max(0) as usize / tcfg.cycle_secs.max(1) as usize;
                 let page = match tcfg.mode {
                     TickerMode::Cycle => step % quotes.len().max(1),
