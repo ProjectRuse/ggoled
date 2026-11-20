@@ -1,16 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod os;
+mod schedule;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
 use ggoled_draw::{DrawDevice, DrawEvent, LayerId, ShiftMode, TextRenderer, bitmap_from_memory};
 use ggoled_lib::{Bitmap, Device};
 use os::{Media, OSFeatures, OSImpl};
 use rfd::{MessageDialog, MessageLevel};
+use schedule::{DisplayMode, Segment, Timing};
 use sdl3_sys::everything as sdl;
 use serde::{Deserialize, Serialize};
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     fmt::Debug,
     os::raw::c_void,
     path::PathBuf,
@@ -21,7 +23,7 @@ use std::{
 
 const NOTIF_DUR: Duration = Duration::from_secs(5);
 
-#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Clone, Copy, PartialEq, Debug)]
 enum ConfigTimeMode {
     Off,
     #[default]
@@ -83,7 +85,38 @@ struct Config {
     oled_shift: ConfigShiftMode,
     status_notify: StatusNotifyMode,
     quit_mode: ConfigQuitMode,
+    /// Follow the [[schedule]] entries below.
+    schedule_enabled: bool,
+    scarlett: ScarlettConfig,
+    // Skipped when empty: "schedule = []" would clash with [[schedule]] entries
+    // added to the file later.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    schedule: Vec<Segment>,
 }
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct ScarlettConfig {
+    /// Apply each schedule entry's scarlett_led_timeout by running `command`.
+    enabled: bool,
+    /// Program and arguments to run. "{seconds}" is replaced with the timeout.
+    /// The value is also written to ggoled_scarlett_led.txt next to the config file.
+    command: Vec<String>,
+}
+impl Default for ScarlettConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            command: vec![
+                "schtasks".into(),
+                "/run".into(),
+                "/tn".into(),
+                "ggoled Scarlett LEDs".into(),
+            ],
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -96,6 +129,9 @@ impl Default for Config {
             oled_shift: ConfigShiftMode::default(),
             status_notify: StatusNotifyMode::default(),
             quit_mode: ConfigQuitMode::default(),
+            schedule_enabled: false,
+            scarlett: ScarlettConfig::default(),
+            schedule: vec![],
         }
     }
 }
@@ -111,14 +147,130 @@ impl Config {
         std::fs::write(Self::path(), text)?;
         Ok(())
     }
-    pub fn load() -> Config {
-        let Ok(text) = std::fs::read_to_string(Self::path()) else {
-            return Config::default();
+    /// Load the config. A missing file gives the defaults; a broken file is an
+    /// error (rather than silently resetting, which would later overwrite it).
+    pub fn load() -> Result<(Config, Vec<Timing>), String> {
+        let text = match std::fs::read_to_string(Self::path()) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Config::default(), vec![])),
+            Err(e) => return Err(format!("Couldn't read {}: {e}", Self::path().display())),
         };
-        let Ok(conf) = toml::from_str(&text) else {
-            return Config::default();
-        };
-        conf
+        let conf: Config =
+            toml::from_str(&text).map_err(|e| format!("Problem in {}:\n\n{e}", Self::path().display()))?;
+        let timings =
+            schedule::parse(&conf.schedule).map_err(|e| format!("Problem in {}:\n\n{e}", Self::path().display()))?;
+        Ok((conf, timings))
+    }
+}
+
+fn show_warning(text: &str) {
+    MessageDialog::new()
+        .set_level(MessageLevel::Warning)
+        .set_title("ggoled")
+        .set_description(text)
+        .show();
+}
+
+/// Open a file with the system's default editor.
+fn open_in_editor(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    let res = std::process::Command::new("notepad").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let res = std::process::Command::new("open").arg("-t").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let res = std::process::Command::new("xdg-open").arg(path).spawn();
+    if let Err(e) = res {
+        show_warning(&format!("Couldn't open {}: {e}", path.display()));
+    }
+}
+
+/// Settings in effect right now: the tray settings, with the active schedule
+/// entry's values layered on top.
+struct Effective {
+    time_mode: ConfigTimeMode,
+    show_media: bool,
+    screensaver: bool,
+    screensaver_secs: u32,
+    display: DisplayMode,
+    brightness: Option<u8>,
+    scarlett_led_timeout: Option<u32>,
+}
+impl Effective {
+    fn new(config: &Config, seg: Option<&Segment>) -> Self {
+        Self {
+            time_mode: seg.and_then(|s| s.time_mode).unwrap_or(config.time_mode),
+            show_media: seg.and_then(|s| s.show_media).unwrap_or(config.show_media),
+            screensaver: seg.and_then(|s| s.screensaver).unwrap_or(config.idle_timeout),
+            screensaver_secs: seg.and_then(|s| s.screensaver_secs).unwrap_or(config.idle_timeout_secs),
+            display: seg.and_then(|s| s.display).unwrap_or_default(),
+            brightness: seg.and_then(|s| s.brightness),
+            scarlett_led_timeout: seg.and_then(|s| s.scarlett_led_timeout),
+        }
+    }
+}
+
+/// Keeps the Scarlett's LED timeout in line with the schedule by running an
+/// external command (see ScarlettConfig). Remembers the last value it applied,
+/// across restarts, so it only runs when something actually changes.
+struct ScarlettSync {
+    applied: Option<u32>,
+    last_attempt: Option<Instant>,
+}
+impl ScarlettSync {
+    fn value_path() -> PathBuf {
+        Config::path().with_file_name("ggoled_scarlett_led.txt")
+    }
+    fn applied_path() -> PathBuf {
+        Config::path().with_file_name("ggoled_scarlett_applied.txt")
+    }
+    fn new() -> Self {
+        let applied = std::fs::read_to_string(Self::applied_path())
+            .ok()
+            .and_then(|t| t.trim().parse().ok());
+        Self {
+            applied,
+            last_attempt: None,
+        }
+    }
+    fn forget(&mut self) {
+        self.applied = None;
+        self.last_attempt = None;
+        _ = std::fs::remove_file(Self::applied_path());
+    }
+    /// Call about once a second. `media_playing` defers the change, since applying
+    /// it briefly interrupts the Scarlett's audio.
+    fn update(&mut self, config: &ScarlettConfig, want: Option<u32>, media_playing: bool) {
+        let Some(want) = want else { return };
+        if !config.enabled || config.command.is_empty() || self.applied == Some(want) || media_playing {
+            return;
+        }
+        if self.last_attempt.is_some_and(|t| t.elapsed() < Duration::from_secs(60)) {
+            return;
+        }
+        self.last_attempt = Some(Instant::now());
+        if let Err(e) = std::fs::write(Self::value_path(), want.to_string()) {
+            eprintln!("scarlett: couldn't write value file: {e}");
+            return;
+        }
+        let args: Vec<String> = config
+            .command
+            .iter()
+            .map(|a| a.replace("{seconds}", &want.to_string()))
+            .collect();
+        let mut cmd = std::process::Command::new(&args[0]);
+        cmd.args(&args[1..]);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                self.applied = Some(want);
+                _ = std::fs::write(Self::applied_path(), want.to_string());
+            }
+            Err(e) => eprintln!("scarlett: couldn't run {:?}: {e}", args[0]),
+        }
     }
 }
 
@@ -198,6 +350,12 @@ enum MenuEvent {
     SetQuitMode(ConfigQuitMode),
     SetIdleDelay(u32),
     SetVolumeOverlay(u32),
+    ToggleSchedule,
+    /// Some(i): hold schedule entry i until the next entry starts. None: end the hold.
+    Hold(Option<usize>),
+    EditConfig,
+    ReloadConfig,
+    ReapplyScarlett,
     Quit,
 }
 
@@ -239,9 +397,93 @@ impl<T: Copy + PartialEq> RadioMenu<T> {
     }
 }
 
+fn menu_check_dyn(menu: *mut sdl::SDL_TrayMenu, pos: i32, label: &CStr, checked: bool) -> *mut sdl::SDL_TrayEntry {
+    let checked = if checked {
+        sdl::SDL_TRAYENTRY_CHECKED
+    } else {
+        sdl::SDL_TrayEntryFlags(0)
+    };
+    unsafe { sdl::SDL_InsertTrayEntryAt(menu, pos, label.as_ptr(), sdl::SDL_TRAYENTRY_CHECKBOX | checked) }
+}
+
+fn segment_label(schedule: &[Segment], i: usize) -> String {
+    match schedule.get(i) {
+        Some(seg) if !seg.name.is_empty() => seg.name.clone(),
+        _ => format!("entry #{}", i + 1),
+    }
+}
+
+/// Position of the first "Hold" entry inside the Schedule submenu.
+const HOLD_MENU_POS: i32 = 2;
+
+/// (Re)create the "Hold: <name>" entries in the Schedule submenu.
+fn rebuild_hold_entries(
+    menu: *mut sdl::SDL_TrayMenu,
+    entries: &mut Vec<*mut sdl::SDL_TrayEntry>,
+    schedule: &[Segment],
+    tx: &mpsc::Sender<MenuEvent>,
+) {
+    for entry in entries.drain(..) {
+        unsafe { sdl::SDL_RemoveTrayEntry(entry) };
+    }
+    for i in 0..schedule.len() {
+        let label = CString::new(format!("Hold: {}", segment_label(schedule, i)).replace('\0', "")).unwrap();
+        let entry = menu_check_dyn(menu, HOLD_MENU_POS + i as i32, &label, false);
+        bind_menu_event(entry, tx, MenuEvent::Hold(Some(i)));
+        entries.push(entry);
+    }
+}
+
+const SCHEDULE_EXAMPLE: &str = r##"
+# ---------------------------------------------------------------------------
+# Schedule example (remove the leading "# " to use it, then use
+# Schedule > Reload config in the tray menu, and turn on "Follow schedule").
+#
+# Each entry starts at `start` on its `days` and lasts until the next entry
+# starts. Anything an entry leaves out uses the normal tray settings.
+#   days:     "daily", "weekdays", "weekends", or "mon", "tue", ... (list)
+#   display:  "Normal" (time/media as usual), "Blank" (dark), "Stock" (SteelSeries UI)
+#   time_mode: "Off", "H24", "H12"      show_media: true/false
+#   screensaver: true/false             screensaver_secs: seconds
+#   brightness: 1-10                    scarlett_led_timeout: seconds
+#
+# [[schedule]]
+# name = "Night"
+# days = ["daily"]
+# start = "00:00"
+# display = "Blank"
+# brightness = 1
+# scarlett_led_timeout = 5
+#
+# [[schedule]]
+# name = "Day"
+# days = ["weekdays"]
+# start = "08:00"
+# display = "Normal"
+# brightness = 5
+# scarlett_led_timeout = 1800
+#
+# [[schedule]]
+# name = "Day"
+# days = ["weekends"]
+# start = "10:00"
+# display = "Normal"
+# brightness = 5
+# scarlett_led_timeout = 1800
+"##;
+
 fn main() {
     // Initial loading
-    let mut config = Config::load();
+    let (mut config, mut timings, mut config_save_blocked) = match Config::load() {
+        Ok((config, timings)) => (config, timings, false),
+        Err(e) => {
+            show_warning(&format!(
+                "{e}\n\nUsing default settings until this is fixed. Your file won't be overwritten; \
+                 fix it and use Schedule > Reload config."
+            ));
+            (Config::default(), vec![], true)
+        }
+    };
     let mut os = OSImpl::new();
 
     // Create tray icon with menu
@@ -260,8 +502,40 @@ fn main() {
     unsafe {
         let tm_version = sdl::SDL_InsertTrayEntryAt(menu, -1, version_label.as_ptr().cast(), sdl::SDL_TRAYENTRY_BUTTON);
         sdl::SDL_SetTrayEntryEnabled(tm_version, false);
-        sdl::SDL_InsertTrayEntryAt(menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON); // separator
     }
+    let tm_status =
+        unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Schedule: off".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
+    unsafe { sdl::SDL_SetTrayEntryEnabled(tm_status, false) };
+
+    // Schedule submenu
+    let sched_entry = unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, c"Schedule".as_ptr(), sdl::SDL_TRAYENTRY_SUBMENU) };
+    let sched_menu = unsafe { sdl::SDL_CreateTraySubmenu(sched_entry) };
+    let tm_sched_enabled = menu_check(sched_menu, c"Follow schedule", config.schedule_enabled);
+    bind_menu_event(tm_sched_enabled, &menu_tx, MenuEvent::ToggleSchedule);
+    unsafe { sdl::SDL_InsertTrayEntryAt(sched_menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON) }; // separator
+    // "Hold: <name>" entries go here (HOLD_MENU_POS)
+    let tm_resume =
+        unsafe { sdl::SDL_InsertTrayEntryAt(sched_menu, -1, c"End hold".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
+    bind_menu_event(tm_resume, &menu_tx, MenuEvent::Hold(None));
+    unsafe { sdl::SDL_InsertTrayEntryAt(sched_menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON) }; // separator
+    let tm_edit =
+        unsafe { sdl::SDL_InsertTrayEntryAt(sched_menu, -1, c"Edit config file".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
+    bind_menu_event(tm_edit, &menu_tx, MenuEvent::EditConfig);
+    let tm_reload =
+        unsafe { sdl::SDL_InsertTrayEntryAt(sched_menu, -1, c"Reload config".as_ptr(), sdl::SDL_TRAYENTRY_BUTTON) };
+    bind_menu_event(tm_reload, &menu_tx, MenuEvent::ReloadConfig);
+    let tm_scarlett = unsafe {
+        sdl::SDL_InsertTrayEntryAt(
+            sched_menu,
+            -1,
+            c"Re-apply Scarlett LEDs".as_ptr(),
+            sdl::SDL_TRAYENTRY_BUTTON,
+        )
+    };
+    bind_menu_event(tm_scarlett, &menu_tx, MenuEvent::ReapplyScarlett);
+    let mut hold_entries: Vec<*mut sdl::SDL_TrayEntry> = vec![];
+    rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &menu_tx);
+    unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON) }; // separator
 
     let tm_time_radio = RadioMenu::new(
         menu,
@@ -423,8 +697,14 @@ fn main() {
     let mut is_connected = false;
     let mut last_volume: Option<u8> = None;
     let mut volume_hold_until = Instant::now();
-    let mut screensaver_active = false;
+    let mut screen_blank = false;
     let mut stock_ui = false;
+    let mut hold: Option<(usize, Option<DateTime<Local>>)> = None;
+    let mut eff = Effective::new(&config, None);
+    let mut last_active: Option<Option<usize>> = None;
+    let mut applied_brightness: Option<u8> = None;
+    let mut last_status = String::new();
+    let mut scarlett = ScarlettSync::new();
 
     // Wait for connect
     let mut last_connect = Instant::now() - Duration::from_secs(1);
@@ -471,6 +751,7 @@ fn main() {
 
         // Handle tray menu events
         let mut config_updated = false;
+        let mut refresh = false; // re-evaluate now, but nothing to save
         while let Ok(event) = menu_rx.try_recv() {
             match event {
                 MenuEvent::ToggleCheck => {
@@ -511,14 +792,64 @@ fn main() {
                     config.volume_overlay_secs = secs;
                     tm_volume_radio.update_checked(secs);
                 }
+                MenuEvent::ToggleSchedule => {
+                    config_updated = true;
+                    config.schedule_enabled = unsafe { sdl::SDL_GetTrayEntryChecked(tm_sched_enabled) };
+                }
+                MenuEvent::Hold(which) => {
+                    hold = which.map(|i| (i, schedule::next_boundary(&timings, Local::now())));
+                    refresh = true;
+                }
+                MenuEvent::EditConfig => {
+                    let path = Config::path();
+                    if !path.exists() && !config_save_blocked {
+                        dialog_unwrap(config.save());
+                    }
+                    if config.schedule.is_empty()
+                        && let Ok(text) = std::fs::read_to_string(&path)
+                        && !text.contains("[[schedule]]")
+                    {
+                        _ = std::fs::write(&path, text + SCHEDULE_EXAMPLE);
+                    }
+                    open_in_editor(&path);
+                }
+                MenuEvent::ReloadConfig => match Config::load() {
+                    Ok((new_config, new_timings)) => {
+                        config = new_config;
+                        timings = new_timings;
+                        config_save_blocked = false;
+                        hold = None;
+                        config_updated = true;
+                        tm_time_radio.update_checked(config.time_mode);
+                        tm_status_notify.update_checked(config.status_notify);
+                        tm_idle_delay_radio.update_checked(config.idle_timeout_secs);
+                        tm_volume_radio.update_checked(config.volume_overlay_secs);
+                        tm_shift_radio.update_checked(config.oled_shift);
+                        tm_quit_mode_radio.update_checked(config.quit_mode);
+                        unsafe {
+                            sdl::SDL_SetTrayEntryChecked(tm_media_check, config.show_media);
+                            sdl::SDL_SetTrayEntryChecked(tm_idle_check, config.idle_timeout);
+                            sdl::SDL_SetTrayEntryChecked(tm_sched_enabled, config.schedule_enabled);
+                        }
+                        dev.set_shift_mode(config.oled_shift.to_api());
+                        rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &menu_tx);
+                    }
+                    Err(e) => show_warning(&format!("{e}\n\nKept the previous settings.")),
+                },
+                MenuEvent::ReapplyScarlett => scarlett.forget(),
                 MenuEvent::Quit => break 'main,
             }
         }
-        if config_updated {
+        if config_updated || refresh {
+            for (i, entry) in hold_entries.iter().enumerate() {
+                unsafe { sdl::SDL_SetTrayEntryChecked(*entry, hold.is_some_and(|(h, _)| h == i)) };
+            }
+        }
+        if config_updated && !config_save_blocked {
             dialog_unwrap(config.save());
         }
 
-        let mut force_redraw = config_updated;
+        let mut force_redraw = config_updated || refresh;
 
         // Handle events
         while let Some(event) = dev.try_event() {
@@ -529,6 +860,7 @@ fn main() {
                 DrawEvent::DeviceReconnected => {
                     unsafe { sdl::SDL_SetTrayIcon(tray, icon.surf) }
                     dev.probe(); // re-probe when base station reappears
+                    applied_brightness = None;
                 }
                 #[allow(clippy::single_match)]
                 DrawEvent::DeviceEvent(event) => match event {
@@ -575,9 +907,65 @@ fn main() {
                 dev.remove_layer(layer);
             }
 
+            // Work out which schedule entry (if any) is in effect
+            if let Some((_, Some(until))) = hold
+                && time >= until
+            {
+                hold = None;
+                for entry in &hold_entries {
+                    unsafe { sdl::SDL_SetTrayEntryChecked(*entry, false) };
+                }
+            }
+            let active_idx = match hold {
+                Some((i, _)) => Some(i),
+                None if config.schedule_enabled => schedule::active(&timings, time),
+                None => None,
+            };
+            eff = Effective::new(&config, active_idx.and_then(|i| config.schedule.get(i)));
+            if last_active != Some(active_idx) {
+                last_active = Some(active_idx);
+                last_media = None; // relayout with the new settings
+            }
+            os.set_idle_timeout(eff.screensaver_secs.saturating_mul(1000));
+            if let Some(b) = eff.brightness
+                && applied_brightness != Some(b)
+            {
+                dev.set_brightness(b);
+                applied_brightness = Some(b);
+            }
+
+            // Tray status line
+            let until_str = |t: Option<DateTime<Local>>| match t {
+                Some(t) => format!("until {}", t.format("%a %H:%M")),
+                None => "until ended".to_string(),
+            };
+            let status = match (hold, active_idx) {
+                (Some((i, until)), _) => {
+                    format!("Holding: {} ({})", segment_label(&config.schedule, i), until_str(until))
+                }
+                (None, Some(i)) => format!(
+                    "Now: {} ({})",
+                    segment_label(&config.schedule, i),
+                    until_str(schedule::next_boundary(&timings, time))
+                ),
+                (None, None) if config.schedule_enabled => "Schedule: no entries".to_string(),
+                (None, None) => "Schedule: off".to_string(),
+            };
+            if status != last_status {
+                if let Ok(c) = CString::new(status.clone()) {
+                    unsafe { sdl::SDL_SetTrayEntryLabel(tm_status, c.as_ptr()) };
+                }
+                last_status = status;
+            }
+
+            // Media (fetched every second: also used to avoid interrupting playback)
+            let playing_media = os.get_media();
+            scarlett.update(&config.scarlett, eff.scarlett_led_timeout, playing_media.is_some());
+
             // Check if idle
-            screensaver_active = config.idle_timeout && os.is_idle();
-            if screensaver_active {
+            let screensaver_active = eff.screensaver && os.is_idle();
+            screen_blank = screensaver_active || eff.display == DisplayMode::Blank;
+            if screen_blank {
                 dev.clear_layers(); // clear screen when idle
                 notif_layer = None;
                 last_media = None; // reset media so we check again when not idle
@@ -594,14 +982,14 @@ fn main() {
                 }
 
                 // Fetch media once a second (before pausing screen)
-                let media = if config.show_media { os.get_media() } else { None };
+                let media = if eff.show_media { playing_media } else { None };
 
                 dev.pause();
 
                 // Time
                 dev.remove_layers(&time_layers);
-                if config.time_mode != ConfigTimeMode::Off {
-                    let time_str = match config.time_mode {
+                if eff.time_mode != ConfigTimeMode::Off {
+                    let time_str = match eff.time_mode {
                         ConfigTimeMode::Off => unreachable!(),
                         ConfigTimeMode::H24 => time.format("%H:%M:%S").to_string(),
                         ConfigTimeMode::H12 => time.format("%l:%M:%S %p").to_string(),
@@ -630,7 +1018,9 @@ fn main() {
         // - Right after a volume change, let the stock volume screen show.
         // - If we have nothing to draw (and aren't blanking for the screensaver),
         //   hand the screen back instead of drawing an empty black frame over it.
-        let want_stock = Instant::now() < volume_hold_until || (!screensaver_active && dev.layer_count() == 0);
+        let want_stock = Instant::now() < volume_hold_until
+            || eff.display == DisplayMode::Stock
+            || (!screen_blank && dev.layer_count() == 0);
         if want_stock != stock_ui {
             stock_ui = want_stock;
             dev.set_stock_ui(want_stock);

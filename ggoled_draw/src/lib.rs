@@ -173,6 +173,7 @@ enum DrawCommand {
     /// true: hand the screen to the SteelSeries UI and stop drawing.
     /// false: take the screen back and resume drawing.
     StockUi(bool),
+    SetBrightness(u8),
 }
 
 #[derive(Debug)]
@@ -268,6 +269,7 @@ fn run_draw_device_thread(
                     }
                     stock_ui = on;
                 }
+                DrawCommand::SetBrightness(value) => _ = dev.set_brightness(value),
             }
         }
 
@@ -519,6 +521,10 @@ impl DrawDevice {
     /// Hand the screen to the SteelSeries UI (true) or take it back (false).
     pub fn set_stock_ui(&mut self, on: bool) {
         _ = self.cmd_sender.send(DrawCommand::StockUi(on));
+    }
+    /// OLED brightness, 1-10.
+    pub fn set_brightness(&mut self, value: u8) {
+        _ = self.cmd_sender.send(DrawCommand::SetBrightness(value.clamp(1, 10)));
     }
     pub fn layer_count(&self) -> usize {
         self.layers.lock().len()

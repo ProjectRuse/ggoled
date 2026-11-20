@@ -1,6 +1,6 @@
 pub const DEFAULT_IDLE_TIMEOUT_MS: u32 = 60_000;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone)]
 pub struct Media {
     pub title: String,
     pub artist: String,
