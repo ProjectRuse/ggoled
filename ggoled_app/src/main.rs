@@ -1186,7 +1186,8 @@ fn main() {
                     }
                     if let Some(text) = &header_scroll {
                         let bitmap = Arc::new(ticker_fonts.small.render_line(text));
-                        ticker_header_layer = Some(dev.add_layer(DrawLayer::Scroll { bitmap, y: -2 }));
+                        let y = ggoled_ticker::grid_header_y(main_q.len(), !compact_q.is_empty(), margin);
+                        ticker_header_layer = Some(dev.add_layer(DrawLayer::Scroll { bitmap, y }));
                     }
                     ticker_header_text = header_scroll.clone();
                 }

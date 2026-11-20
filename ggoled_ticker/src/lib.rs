@@ -556,12 +556,17 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
     let mut b = Bitmap::new(WIDTH, HEIGHT, false);
     let (left, right) = (margin as isize, (WIDTH - margin) as isize);
     let inner = WIDTH - 2 * margin;
+    let top = margin as isize - SMALL_INK_TOP;
     let label = fonts.small.render_line(&q.display_label());
-    blit(&mut b, &label, left, -2);
+    blit(&mut b, &label, left, top);
     if let Some(pct) = q.change_pct() {
         let ch = fonts.small.render_line(&format_change(pct));
-        blit(&mut b, &ch, right - ch.w as isize, -2);
+        blit(&mut b, &ch, right - ch.w as isize, top);
     }
+    const TREND_H: usize = 14;
+    let trend_y = (HEIGHT - margin - TREND_H) as isize;
+    // the price goes in the space between the top row and the trend line
+    let (area_top, area_bottom) = (margin as isize + SMALL_INK_H + 1, trend_y - 1);
     match q.price {
         Some(price) => {
             let text = format_price(price);
@@ -570,9 +575,14 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
             if big.w > inner {
                 big = fonts.small.render_line(&text);
             }
-            let y = if big.h > 20 { 10 } else { 20 };
+            let (ink_top, ink_h) = if big.h > 20 {
+                (BIG_INK_TOP, BIG_INK_H)
+            } else {
+                (SMALL_INK_TOP, SMALL_INK_H)
+            };
+            let y = area_top + (area_bottom - area_top - ink_h) / 2 - ink_top;
             blit(&mut b, &big, ((WIDTH - big.w.min(WIDTH)) / 2) as isize, y);
-            draw_trend(&mut b, q, left, 46, inner, 18);
+            draw_trend(&mut b, q, left, trend_y, inner, TREND_H);
         }
         None => {
             let msg = if q.error.is_some() { "no data" } else { "loading..." };
@@ -584,7 +594,56 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
 }
 
 pub const GRID_ROWS: usize = 4;
-const ROW_H: usize = HEIGHT / GRID_ROWS;
+
+// Where the ink sits inside a rendered line of the pixel font (measured):
+// 16px font: rows 4..=14 (incl. commas), 32px: rows 8..=29.
+const SMALL_INK_TOP: isize = 4;
+const SMALL_INK_H: isize = 11;
+const BIG_INK_TOP: isize = 8;
+const BIG_INK_H: isize = 22;
+/// The compact row: two lines of the 5x7 font with a 1px gap.
+const COMPACT_H: isize = 2 * font5x7::GLYPH_H as isize + 1;
+
+/// Spread blocks of the given heights evenly over the screen height inside the
+/// margin; returns each block's top y.
+fn spread(heights: &[isize], margin: usize) -> Vec<isize> {
+    let avail = (HEIGHT - 2 * margin) as isize;
+    let total: isize = heights.iter().sum();
+    let gaps = heights.len().saturating_sub(1) as isize;
+    let free = (avail - total).max(0);
+    let mut y = margin as isize;
+    heights
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let top = y;
+            // distribute the free space as evenly as whole pixels allow
+            let gap = if (i as isize) < gaps {
+                free * (i as isize + 1) / gaps - free * i as isize / gaps
+            } else {
+                0
+            };
+            y += h + gap;
+            top
+        })
+        .collect()
+}
+
+/// Row tops for the list layout (header first if any, then assets, then compact).
+fn grid_row_tops(header: bool, main_rows: usize, compact: bool, margin: usize) -> Vec<isize> {
+    let mut heights = vec![SMALL_INK_H; header as usize + main_rows];
+    if compact {
+        heights.push(COMPACT_H);
+    }
+    spread(&heights, margin)
+}
+
+/// The y to draw a 16px line at for the list layout's header row (e.g. for a
+/// scrolling header drawn separately).
+pub fn grid_header_y(main_count: usize, has_compact: bool, margin: usize) -> isize {
+    let main_rows = main_count.min(GRID_ROWS - 1 - has_compact as usize);
+    grid_row_tops(true, main_rows, has_compact, margin)[0] - SMALL_INK_TOP
+}
 
 /// The list layout's top row.
 pub enum Header<'a> {
@@ -611,24 +670,25 @@ pub fn grid_has_header_room(main_count: usize, has_compact: bool) -> bool {
 pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fonts, margin: usize) -> Bitmap {
     let mut b = Bitmap::new(WIDTH, HEIGHT, false);
     let (left, right) = (margin as isize, (WIDTH - margin) as isize);
-    let mut row = 0;
-    match header {
-        Header::None => {}
-        Header::Text(text) => {
+    let has_header = !matches!(header, Header::None);
+    let has_compact = !compact.is_empty();
+    let main_rows = main.len().min(GRID_ROWS - has_header as usize - has_compact as usize);
+    let tops = grid_row_tops(has_header, main_rows, has_compact, margin);
+    let mut rows = tops.iter();
+    if has_header {
+        let y = rows.next().unwrap() - SMALL_INK_TOP;
+        if let Header::Text(text) = header {
             let t = fonts.small.render_line(text);
             let x = if t.w > WIDTH - 2 * margin {
                 left
             } else {
                 ((WIDTH - t.w) / 2) as isize
             };
-            blit(&mut b, &t, x, -2);
-            row += 1;
+            blit(&mut b, &t, x, y);
         }
-        Header::Reserved => row += 1,
     }
-    let main_rows = GRID_ROWS - row - (!compact.is_empty()) as usize;
     for q in main.iter().take(main_rows) {
-        let y = (row * ROW_H) as isize - 2;
+        let y = rows.next().unwrap() - SMALL_INK_TOP;
         let label = fonts.small.render_line(&q.display_label());
         blit(&mut b, &label, left, y);
         let mut x_right = right;
@@ -644,12 +704,10 @@ pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fo
         if px > left + label.w as isize + 2 {
             blit(&mut b, &price, px, y);
         }
-        row += 1;
     }
-    if !compact.is_empty() && row < GRID_ROWS {
+    if let Some(&y) = rows.next() {
         let cols = compact.len().min(4);
         let col_w = (WIDTH - 2 * margin) / cols;
-        let y = (row * ROW_H) as isize;
         for (i, q) in compact.iter().take(cols).enumerate() {
             let col_x = left + (i * col_w) as isize;
             let center = |w: usize| col_x + (col_w as isize - w as isize) / 2;
@@ -733,5 +791,51 @@ mod tests {
         let b = render_grid(&many, &many[..3], Header::Text("12:00:00"), &fonts, 4);
         assert_eq!((b.w, b.h), (WIDTH, HEIGHT));
         assert!(render_scroll(&[q, empty], &fonts).w > WIDTH);
+    }
+
+    fn ink_bounds(b: &Bitmap) -> Option<(usize, usize, usize, usize)> {
+        let mut r: Option<(usize, usize, usize, usize)> = None;
+        for y in 0..b.h {
+            for x in 0..b.w {
+                if b.data[y * b.w + x] {
+                    let (x0, y0, x1, y1) = r.unwrap_or((x, y, x, y));
+                    r = Some((x0.min(x), y0.min(y), x1.max(x), y1.max(y)));
+                }
+            }
+        }
+        r
+    }
+
+    #[test]
+    fn stays_inside_margins() {
+        let fonts = Fonts::default();
+        let q = |sym: &str, name: &str, price: f64| Quote {
+            symbol: sym.into(),
+            name: name.into(),
+            price: Some(price),
+            prev_close: Some(price * 1.05),
+            intraday: (0..100)
+                .map(|i| price + (i as f64 * 0.3).sin() * price * 0.03)
+                .collect(),
+            ..Default::default()
+        };
+        let main = [q("BTC-USD", "BTC", 159_033.5), q("MSTR", "MSTR", 81.01)];
+        let compact = [
+            q("^GSPC", "S&P", 6000.0),
+            q("^DJI", "DOW", 44000.0),
+            q("^IXIC", "NAS", 19000.0),
+        ];
+        for margin in [0, 1, 4] {
+            let grid = render_grid(&main, &compact, Header::Text("12:55:03 PM"), &fonts, margin);
+            let cycle = render_cycle(&main[0], &fonts, margin);
+            for b in [grid, cycle] {
+                let (x0, y0, x1, y1) = ink_bounds(&b).unwrap();
+                assert!(x0 >= margin && y0 >= margin, "margin {margin}: {x0},{y0}");
+                assert!(
+                    x1 < WIDTH - margin && y1 < HEIGHT - margin,
+                    "margin {margin}: {x1},{y1}"
+                );
+            }
+        }
     }
 }
