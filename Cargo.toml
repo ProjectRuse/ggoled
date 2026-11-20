@@ -5,6 +5,7 @@ members = [
     "ggoled_lib",
     "ggoled_draw",
     "ggoled_app",
+    "ggoled_ticker",
 ]
 
 [workspace.package]

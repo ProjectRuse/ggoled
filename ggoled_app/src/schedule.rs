@@ -15,6 +15,8 @@ pub enum DisplayMode {
     Blank,
     /// Leave the screen to the SteelSeries UI.
     Stock,
+    /// Show the price ticker.
+    Ticker,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]

@@ -1,0 +1,17 @@
+[package]
+name = "ggoled_ticker"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+ggoled_lib = { path = "../ggoled_lib" }
+ggoled_draw = { path = "../ggoled_draw" }
+
+anyhow = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+[dev-dependencies]
+image = "0.25"

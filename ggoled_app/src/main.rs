@@ -4,8 +4,9 @@ mod os;
 mod schedule;
 
 use chrono::{DateTime, Local, TimeDelta, Timelike};
-use ggoled_draw::{DrawDevice, DrawEvent, LayerId, ShiftMode, TextRenderer, bitmap_from_memory};
+use ggoled_draw::{DrawDevice, DrawEvent, DrawLayer, LayerId, ShiftMode, TextRenderer, bitmap_from_memory};
 use ggoled_lib::{Bitmap, Device};
+use ggoled_ticker::{Ticker, TickerConfig, TickerMode};
 use os::{Media, OSFeatures, OSImpl};
 use rfd::{MessageDialog, MessageLevel};
 use schedule::{DisplayMode, Segment, Timing};
@@ -85,6 +86,9 @@ struct Config {
     oled_shift: ConfigShiftMode,
     status_notify: StatusNotifyMode,
     quit_mode: ConfigQuitMode,
+    /// What the screen shows (schedule entries can override this).
+    display: DisplayMode,
+    ticker: TickerConfig,
     /// Follow the [[schedule]] entries below.
     schedule_enabled: bool,
     /// Days that "weekends" means in the schedule (the rest are "weekdays"),
@@ -132,6 +136,8 @@ impl Default for Config {
             oled_shift: ConfigShiftMode::default(),
             status_notify: StatusNotifyMode::default(),
             quit_mode: ConfigQuitMode::default(),
+            display: DisplayMode::Normal,
+            ticker: TickerConfig::default(),
             schedule_enabled: false,
             weekend_days: "sat-sun".into(),
             scarlett: ScarlettConfig::default(),
@@ -207,7 +213,7 @@ impl Effective {
             show_media: seg.and_then(|s| s.show_media).unwrap_or(config.show_media),
             screensaver: seg.and_then(|s| s.screensaver).unwrap_or(config.idle_timeout),
             screensaver_secs: seg.and_then(|s| s.screensaver_secs).unwrap_or(config.idle_timeout_secs),
-            display: seg.and_then(|s| s.display).unwrap_or_default(),
+            display: seg.and_then(|s| s.display).unwrap_or(config.display),
             brightness: seg.and_then(|s| s.brightness),
             scarlett_led_timeout: seg.and_then(|s| s.scarlett_led_timeout),
         }
@@ -352,6 +358,8 @@ fn menu_callback(entry: *mut sdl::SDL_TrayEntry, f: impl Fn()) {
 enum MenuEvent {
     ToggleCheck,
     SetTimeMode(ConfigTimeMode),
+    SetDisplay(DisplayMode),
+    SetTickerMode(TickerMode),
     SetShiftMode(ConfigShiftMode),
     SetStatusNotifyMode(StatusNotifyMode),
     SetQuitMode(ConfigQuitMode),
@@ -459,7 +467,7 @@ const SCHEDULE_EXAMPLE: &str = r##"
 # starts. Anything an entry leaves out uses the normal tray settings.
 #   days:     "daily", "weekdays", "weekends", "mon", ..., or ranges like "fri-sun" (list)
 #             "weekends" follows Schedule > Weekend days in the tray (Sat-Sun or Fri-Sun)
-#   display:  "Normal" (time/media as usual), "Blank" (dark), "Stock" (SteelSeries UI)
+#   display:  "Normal" (time/media), "Ticker" (prices), "Blank" (dark), "Stock" (SteelSeries UI)
 #   time_mode: "Off", "H24", "H12"      show_media: true/false
 #   screensaver: true/false             screensaver_secs: seconds
 #   brightness: 1-10                    scarlett_led_timeout: seconds
@@ -562,6 +570,32 @@ fn main() {
     let mut hold_entries: Vec<*mut sdl::SDL_TrayEntry> = vec![];
     rebuild_hold_entries(sched_menu, &mut hold_entries, &config.schedule, &timings, &menu_tx);
     unsafe { sdl::SDL_InsertTrayEntryAt(menu, -1, std::ptr::null(), sdl::SDL_TRAYENTRY_BUTTON) }; // separator
+
+    let tm_display_radio = RadioMenu::new(
+        menu,
+        c"Display",
+        &[
+            (c"Clock && media", DisplayMode::Normal),
+            (c"Price ticker", DisplayMode::Ticker),
+            (c"Blank", DisplayMode::Blank),
+            (c"SteelSeries screen", DisplayMode::Stock),
+        ],
+        config.display,
+        &menu_tx,
+        MenuEvent::SetDisplay,
+    );
+    let tm_ticker_radio = RadioMenu::new(
+        menu,
+        c"Ticker layout",
+        &[
+            (c"One at a time (large)", TickerMode::Cycle),
+            (c"All at once (list)", TickerMode::Grid),
+            (c"Scrolling", TickerMode::Scroll),
+        ],
+        config.ticker.mode,
+        &menu_tx,
+        MenuEvent::SetTickerMode,
+    );
 
     let tm_time_radio = RadioMenu::new(
         menu,
@@ -731,6 +765,10 @@ fn main() {
     let mut applied_brightness: Option<u8> = None;
     let mut last_status = String::new();
     let mut scarlett = ScarlettSync::new();
+    let ticker = Ticker::new(config.ticker.clone());
+    let ticker_fonts = ggoled_ticker::Fonts::default();
+    let mut ticker_layer: Option<LayerId> = None;
+    let mut ticker_key: Option<(u64, TickerMode, usize)> = None;
 
     // Wait for connect
     let mut last_connect = Instant::now() - Duration::from_secs(1);
@@ -818,6 +856,17 @@ fn main() {
                     config.volume_overlay_secs = secs;
                     tm_volume_radio.update_checked(secs);
                 }
+                MenuEvent::SetDisplay(display) => {
+                    config_updated = true;
+                    config.display = display;
+                    tm_display_radio.update_checked(display);
+                }
+                MenuEvent::SetTickerMode(mode) => {
+                    config_updated = true;
+                    config.ticker.mode = mode;
+                    tm_ticker_radio.update_checked(mode);
+                    ticker.set_config(&config.ticker);
+                }
                 MenuEvent::SetWeekend(mask) => {
                     tm_weekend_radio.update_checked(mask);
                     let spec = if mask == schedule::FRI_SUN {
@@ -871,6 +920,9 @@ fn main() {
                         tm_shift_radio.update_checked(config.oled_shift);
                         tm_quit_mode_radio.update_checked(config.quit_mode);
                         tm_weekend_radio.update_checked(weekend_mask(&config));
+                        tm_display_radio.update_checked(config.display);
+                        tm_ticker_radio.update_checked(config.ticker.mode);
+                        ticker.set_config(&config.ticker);
                         unsafe {
                             sdl::SDL_SetTrayEntryChecked(tm_media_check, config.show_media);
                             sdl::SDL_SetTrayEntryChecked(tm_idle_check, config.idle_timeout);
@@ -1014,11 +1066,89 @@ fn main() {
             // Check if idle
             let screensaver_active = eff.screensaver && os.is_idle();
             screen_blank = screensaver_active || eff.display == DisplayMode::Blank;
+            let show_ticker = !screen_blank && eff.display == DisplayMode::Ticker;
+            ticker.set_active(show_ticker);
             if screen_blank {
                 dev.clear_layers(); // clear screen when idle
                 notif_layer = None;
+                ticker_layer = None;
+                ticker_key = None;
                 last_media = None; // reset media so we check again when not idle
+            } else if show_ticker {
+                // Price ticker replaces the clock and media
+                if notif_layer.is_none() {
+                    notif_update(
+                        &mut dev,
+                        &mut notif_layer,
+                        config.status_notify,
+                        is_connected,
+                        notif_expiry,
+                    );
+                }
+                dev.remove_layers(&time_layers);
+                dev.remove_layers(&media_layers);
+                time_layers.clear();
+                media_layers.clear();
+                last_media = None;
+
+                let quotes = ticker.quotes();
+                let tcfg = &config.ticker;
+                let step = time.timestamp().max(0) as usize / tcfg.cycle_secs.max(1) as usize;
+                let page = match tcfg.mode {
+                    TickerMode::Cycle => step % quotes.len().max(1),
+                    TickerMode::Grid => step % quotes.len().div_ceil(ggoled_ticker::GRID_ROWS).max(1),
+                    TickerMode::Scroll => 0,
+                };
+                // For scrolling, only rebuild when the text changes (rebuilding restarts the scroll)
+                let content = match tcfg.mode {
+                    TickerMode::Scroll => {
+                        let mut h = std::hash::DefaultHasher::new();
+                        std::hash::Hash::hash(&ggoled_ticker::scroll_text(&quotes), &mut h);
+                        std::hash::Hasher::finish(&h)
+                    }
+                    _ => ticker.generation(),
+                };
+                let key = (content, tcfg.mode, page);
+                if ticker_key != Some(key) {
+                    ticker_key = Some(key);
+                    dev.pause();
+                    if let Some(id) = ticker_layer.take() {
+                        dev.remove_layer(id);
+                    }
+                    if !quotes.is_empty() {
+                        let layer = match tcfg.mode {
+                            TickerMode::Cycle => DrawLayer::Image {
+                                bitmap: Arc::new(ggoled_ticker::render_cycle(&quotes[page], &ticker_fonts)),
+                                x: 0,
+                                y: 0,
+                            },
+                            TickerMode::Grid => DrawLayer::Image {
+                                bitmap: Arc::new(ggoled_ticker::render_grid(
+                                    &quotes[page * ggoled_ticker::GRID_ROWS..],
+                                    &ticker_fonts,
+                                )),
+                                x: 0,
+                                y: 0,
+                            },
+                            TickerMode::Scroll => {
+                                let bitmap = Arc::new(ggoled_ticker::render_scroll(&quotes, &ticker_fonts));
+                                let y = (ggoled_ticker::HEIGHT as isize - bitmap.h as isize) / 2;
+                                if bitmap.w >= ggoled_ticker::WIDTH {
+                                    DrawLayer::Scroll { bitmap, y }
+                                } else {
+                                    DrawLayer::Image { bitmap, x: 0, y }
+                                }
+                            }
+                        };
+                        ticker_layer = Some(dev.add_layer(layer));
+                    }
+                    dev.play();
+                }
             } else {
+                if let Some(id) = ticker_layer.take() {
+                    dev.remove_layer(id);
+                    ticker_key = None;
+                }
                 // Update notifications
                 if notif_layer.is_none() {
                     notif_update(

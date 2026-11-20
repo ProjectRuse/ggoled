@@ -29,10 +29,45 @@ impl TextRenderer {
         Ok(Self { font, size })
     }
     pub fn new_pixel_operator() -> Self {
+        Self::new_pixel_operator_sized(16.0)
+    }
+    /// The built-in pixel font at another size. Multiples of 16 stay crisp.
+    pub fn new_pixel_operator_sized(size: f32) -> Self {
         Self {
             font: Font::try_from_bytes(include_bytes!("../fonts/PixelOperator.ttf")).unwrap(),
-            size: 16.0,
+            size,
         }
+    }
+    /// Render one line of text into a bitmap exactly `line_height()` tall, with the
+    /// baseline at the same height regardless of which characters are used, so
+    /// different strings line up when placed side by side.
+    pub fn render_line(&self, text: &str) -> Bitmap {
+        let scale = self.scale();
+        let v_metrics = self.font.v_metrics(scale);
+        let glyphs: Vec<_> = self
+            .font
+            .layout(&text.replace(['\n', '\r'], " "), scale, point(0.0, v_metrics.ascent))
+            .collect();
+        let width = glyphs
+            .last()
+            .map(|g| g.position().x + g.unpositioned().h_metrics().advance_width)
+            .unwrap_or(0.0)
+            .ceil()
+            .max(0.0) as usize;
+        let height = self.line_height();
+        let mut bitmap = Bitmap::new(width, height, false);
+        for glyph in glyphs {
+            if let Some(bb) = glyph.pixel_bounding_box() {
+                glyph.draw(|x, y, v| {
+                    let px = bb.min.x + x as i32;
+                    let py = bb.min.y + y as i32;
+                    if v > 0.5 && px >= 0 && py >= 0 && (px as usize) < width && (py as usize) < height {
+                        bitmap.data.set(py as usize * width + px as usize, true);
+                    }
+                })
+            }
+        }
+        bitmap
     }
     fn scale(&self) -> Scale {
         Scale::uniform(self.size)
