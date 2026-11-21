@@ -39,6 +39,10 @@ A game is:
 - a program in the "always treat as games" list (for games RTSS doesn't hook,
   or if you don't use RTSS). Use the name from Task Manager's Details tab.
 
+Scarlett LED timeout changes (which briefly cut its audio) wait while a game
+is running, in front or in the background (RTSS still drawing its frames),
+until about 15 seconds after it closes.
+
 ```toml
 [sysinfo]
 auto_when_gaming = true

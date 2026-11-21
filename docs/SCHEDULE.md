@@ -116,6 +116,7 @@ command = ["schtasks", "/run", "/tn", "ggoled Scarlett LEDs"]
 ggoled writes the value to `ggoled_scarlett_led.txt` next to the config file and
 runs `command` (`{seconds}` in an argument is replaced with the value). Changing
 the timeout interrupts the Scarlett's audio for a few seconds, so ggoled waits
-while media is playing, and only runs again when the value changes.
+while media is playing or a game is running (see docs/SYSINFO.md), and only
+runs again when the value changes.
 **Schedule → Re-apply Scarlett LEDs** forces it (e.g. after Focusrite Control 2
 reset the timeout).

@@ -115,6 +115,8 @@ struct Shared {
     /// Collect readings (CPU/GPU/LHM); game detection runs regardless
     active: bool,
     gaming_until: Option<Instant>,
+    /// A game is running, in front or not (for waiting before disruptive changes)
+    running_until: Option<Instant>,
 }
 
 /// Collects readings in a background thread, once a second.
@@ -130,6 +132,7 @@ impl SysInfo {
             sources: Sources::default(),
             active: false,
             gaming_until: None,
+            running_until: None,
         }));
         let thread_shared = shared.clone();
         thread::spawn(move || collector(thread_shared));
@@ -147,6 +150,12 @@ impl SysInfo {
     }
     pub fn sources(&self) -> Sources {
         self.shared.lock().sources.clone()
+    }
+    /// Whether a game is running, even in the background: RTSS is measuring
+    /// frames for a program that isn't excluded, or a game is in front. Stays
+    /// true for a few seconds after, so a loading screen doesn't count as closed.
+    pub fn game_running(&self) -> bool {
+        self.shared.lock().running_until.is_some_and(|t| Instant::now() < t)
     }
     /// Whether a game is (or very recently was) in the foreground.
     pub fn gaming(&self) -> bool {
@@ -216,6 +225,16 @@ fn collector(shared: Arc<Mutex<Shared>>) {
             }
         }
         snap.game = game.clone();
+        // Any game RTSS is drawing frames for, in front or not
+        let background_game = rtss.as_ref().is_some_and(|apps| {
+            apps.iter().any(|a| {
+                let exe = a.name.rsplit(['\\', '/']).next().unwrap_or(&a.name);
+                let updating = rtss_seen
+                    .get(&a.pid)
+                    .is_some_and(|(_, changed)| now.duration_since(*changed) < Duration::from_secs(3));
+                updating && !config.ignore_programs.iter().any(|p| same_program(p, exe))
+            })
+        });
 
         if active {
             if let Some(sys) = &mut sys {
@@ -261,6 +280,9 @@ fn collector(shared: Arc<Mutex<Shared>>) {
             s.sources = sources;
             if game.is_some() && config.auto_when_gaming {
                 s.gaming_until = Some(now + Duration::from_secs(config.linger_secs as u64));
+            }
+            if game.is_some() || background_game {
+                s.running_until = Some(now + Duration::from_secs(15));
             }
         }
         thread::sleep(Duration::from_secs(1));

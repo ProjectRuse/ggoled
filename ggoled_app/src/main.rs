@@ -101,11 +101,11 @@ impl ScarlettSync {
         self.last_attempt = None;
         _ = std::fs::remove_file(Self::applied_path());
     }
-    /// Call about once a second. `media_playing` defers the change, since applying
-    /// it briefly interrupts the Scarlett's audio.
-    fn update(&mut self, config: &ScarlettConfig, want: Option<u32>, media_playing: bool) {
+    /// Call about once a second. `busy` (media playing, a game running) defers the
+    /// change, since applying it briefly interrupts the Scarlett's audio.
+    fn update(&mut self, config: &ScarlettConfig, want: Option<u32>, busy: bool) {
         let Some(want) = want else { return };
-        if !config.enabled || config.command.is_empty() || self.applied == Some(want) || media_playing {
+        if !config.enabled || config.command.is_empty() || self.applied == Some(want) || busy {
             return;
         }
         // The scheduled task ignores a second start while one is running; the script
@@ -1041,7 +1041,12 @@ fn main() {
 
             // Media (fetched every second: also used to avoid interrupting playback)
             let playing_media = os.get_media();
-            scarlett.update(&config.scarlett, eff.scarlett_led_timeout, playing_media.is_some());
+            // Changing the Scarlett briefly cuts its audio: wait for media and games to finish
+            scarlett.update(
+                &config.scarlett,
+                eff.scarlett_led_timeout,
+                playing_media.is_some() || sysinfo.game_running(),
+            );
 
             // Check if idle
             let screensaver_active = eff.screensaver && os.is_idle();
