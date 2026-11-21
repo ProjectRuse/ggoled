@@ -28,9 +28,9 @@ fn main() {
         gpu_temp: Some(72.0),
         gpu_power: Some(245.0),
         vram_used: Some(7.1),
-        vram_total: Some(12.0),
-        ram_used: Some(18.2),
-        ram_total: Some(32.0),
+        vram_total: Some(16.0),
+        ram_used: Some(19.4),
+        ram_total: Some(63.7),
         fps: Some(144.0),
         ..Default::default()
     };

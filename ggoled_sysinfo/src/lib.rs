@@ -24,6 +24,8 @@ use std::{
 };
 
 pub const WIDTH: usize = 128;
+/// Bytes per GB as Task Manager counts them
+const GIB: f32 = 1024.0 * 1024.0 * 1024.0;
 pub const HEIGHT: usize = 64;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -80,7 +82,7 @@ pub struct Snapshot {
     pub gpu_load: Option<f32>,
     pub gpu_temp: Option<f32>,
     pub gpu_power: Option<f32>,
-    /// GB
+    /// GB in binary units (GiB), as Windows' Task Manager shows them
     pub vram_used: Option<f32>,
     pub vram_total: Option<f32>,
     pub ram_used: Option<f32>,
@@ -220,8 +222,8 @@ fn collector(shared: Arc<Mutex<Shared>>) {
                 sys.refresh_cpu_usage();
                 sys.refresh_memory();
                 snap.cpu_load = Some(sys.global_cpu_usage());
-                snap.ram_used = Some(sys.used_memory() as f32 / 1e9);
-                snap.ram_total = Some(sys.total_memory() as f32 / 1e9);
+                snap.ram_used = Some(sys.used_memory() as f32 / GIB);
+                snap.ram_total = Some(sys.total_memory() as f32 / GIB);
             }
             if let Some(nvml) = &nvml
                 && let Ok(dev) = nvml.device_by_index(0)
@@ -231,8 +233,8 @@ fn collector(shared: Arc<Mutex<Shared>>) {
                 snap.gpu_load = dev.utilization_rates().ok().map(|u| u.gpu as f32);
                 snap.gpu_power = dev.power_usage().ok().map(|mw| mw as f32 / 1000.0);
                 if let Ok(mem) = dev.memory_info() {
-                    snap.vram_used = Some(mem.used as f32 / 1e9);
-                    snap.vram_total = Some(mem.total as f32 / 1e9);
+                    snap.vram_used = Some(mem.used as f32 / GIB);
+                    snap.vram_total = Some(mem.total as f32 / GIB);
                 }
             }
             if now >= lhm_retry_at {
@@ -450,14 +452,24 @@ pub fn render(s: &Snapshot, fonts: &Fonts, margin: usize) -> Bitmap {
         }
         row(&mut b, tops[1], "CPU", &cpu);
         row(&mut b, tops[2], "GPU", &gpu);
+        // used/total in whole GB, e.g. "VRAM 7/16  RAM 19/64"
+        let pair = |used: Option<f32>, total: Option<f32>| match (used, total) {
+            (Some(u), Some(t)) => Some(format!("{:.0}/{:.0}", u, t)),
+            (Some(u), None) => Some(format!("{u:.0}")),
+            _ => None,
+        };
         let mut mem = vec![];
-        if let Some(v) = s.vram_used {
-            mem.push(format!("VRAM {}G", gb(v)));
+        if let Some(v) = pair(s.vram_used, s.vram_total) {
+            mem.push(format!("VRAM {v}"));
         }
-        if let Some(r) = s.ram_used {
-            mem.push(format!("RAM {}G", gb(r)));
+        if let Some(r) = pair(s.ram_used, s.ram_total) {
+            mem.push(format!("RAM {r}"));
         }
-        let m = font5x7::render(&mem.join("  "));
+        let mut text = mem.join("  ");
+        if font5x7::text_width(&text) > WIDTH - 2 * margin {
+            text = mem.join(" ");
+        }
+        let m = font5x7::render(&text);
         blit(&mut b, &m, (WIDTH as isize - m.w as isize) / 2, tops[3]);
     } else {
         let tops = spread(&[SMALL_INK_H; 4], margin);
@@ -490,9 +502,9 @@ mod tests {
             gpu_temp: Some(72.0),
             gpu_power: Some(245.0),
             vram_used: Some(7.1),
-            vram_total: Some(12.0),
-            ram_used: Some(18.2),
-            ram_total: Some(32.0),
+            vram_total: Some(16.0),
+            ram_used: Some(19.4),
+            ram_total: Some(63.7),
             fps,
             game: fps.map(|_| "Warframe.x64.exe".into()),
         }

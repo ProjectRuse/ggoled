@@ -7,7 +7,8 @@ schedule entry, or let it switch on automatically while you play.
 ## Layouts
 
 - **In a game** (when RTSS is measuring it): large FPS with GPU power draw,
-  CPU and GPU load and temperature, and VRAM/RAM in small text.
+  CPU and GPU load and temperature, and VRAM/RAM used out of total in small
+  text (e.g. `VRAM 7/16  RAM 19/64`).
 - **Otherwise:** CPU, GPU, VRAM and RAM rows.
 
 ## Where the numbers come from
@@ -19,7 +20,8 @@ schedule entry, or let it switch on automatically while you play.
 | CPU temperature | LibreHardwareMonitor's web server | run LibreHardwareMonitor with Options > Remote Web Server > Run (default address `http://localhost:8085/data.json`) |
 | FPS, game detection | RivaTuner Statistics Server (RTSS) | keep RTSS running; its own on-screen display can be off |
 
-Anything unavailable is left out (shown as `--`). **Settings → System info**
+Memory is in the same units as Task Manager (1 GB = 1024³ bytes); RAM "used"
+matches Task Manager's "In use". Anything unavailable is shown as `--`. **Settings → System info**
 shows which sources are working and live readings.
 
 ## Games
