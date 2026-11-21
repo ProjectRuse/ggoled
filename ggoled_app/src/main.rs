@@ -450,6 +450,7 @@ fn main() {
         &[
             (c"Clock && media", DisplayMode::Normal),
             (c"Price ticker", DisplayMode::Ticker),
+            (c"System info", DisplayMode::SystemInfo),
             (c"Blank", DisplayMode::Blank),
             (c"SteelSeries screen", DisplayMode::Stock),
         ],
@@ -637,6 +638,9 @@ fn main() {
     let mut shown_display: Option<DisplayMode> = None;
     let mut settings_child: Option<std::process::Child> = None;
     let mut locked_since: Option<Instant> = None;
+    let sysinfo = ggoled_sysinfo::SysInfo::new(config.sysinfo.clone());
+    let sysinfo_fonts = ggoled_sysinfo::Fonts::default();
+    let mut sysinfo_layer: Option<LayerId> = None;
     let mut config_mtime = config_file_mtime();
     let mut last_config_check = Instant::now();
     let mut eff = Effective::new(&config, None);
@@ -828,6 +832,7 @@ fn main() {
                         tm_display_radio.update_checked(config.display);
                         tm_ticker_radio.update_checked(config.ticker.mode);
                         ticker.set_config(&config.ticker);
+                        sysinfo.set_config(&config.sysinfo);
                         unsafe {
                             sdl::SDL_SetTrayEntryChecked(tm_media_check, config.show_media);
                             sdl::SDL_SetTrayEntryChecked(tm_idle_check, config.idle_timeout);
@@ -964,6 +969,11 @@ fn main() {
             {
                 eff.display = display;
             }
+            // A game in the foreground shows system info (unless locked)
+            let gaming = !locked && config.sysinfo.auto_when_gaming && sysinfo.gaming();
+            if gaming {
+                eff.display = DisplayMode::SystemInfo;
+            }
             if locked && !config.lock_scarlett {
                 eff.scarlett_led_timeout = None; // leave the Scarlett as it is
             }
@@ -1008,6 +1018,11 @@ fn main() {
                 Some(_) if !locked => format!("{status} · display set manually"),
                 _ => status,
             };
+            let status = match (gaming, sysinfo.snapshot().game) {
+                (true, Some(game)) => format!("{status} · game: {}", game.trim_end_matches(".exe")),
+                (true, None) => format!("{status} · game"),
+                _ => status,
+            };
             let status = match lock_state {
                 None => format!("{status} · can't detect locking"),
                 _ => status,
@@ -1033,6 +1048,21 @@ fn main() {
             screen_blank = screensaver_active || eff.display == DisplayMode::Blank;
             let show_ticker = !screen_blank && eff.display == DisplayMode::Ticker;
             ticker.set_active(show_ticker);
+            let show_sysinfo = !screen_blank && eff.display == DisplayMode::SystemInfo;
+            sysinfo.set_active(show_sysinfo);
+            if !show_sysinfo && let Some(id) = sysinfo_layer.take() {
+                dev.remove_layer(id);
+            }
+            if !show_ticker {
+                if let Some(id) = ticker_layer.take() {
+                    dev.remove_layer(id);
+                    ticker_key = None;
+                }
+                if let Some(id) = ticker_header_layer.take() {
+                    dev.remove_layer(id);
+                    ticker_header_text = None;
+                }
+            }
             if screen_blank {
                 dev.clear_layers(); // clear screen when idle
                 notif_layer = None;
@@ -1040,7 +1070,36 @@ fn main() {
                 ticker_key = None;
                 ticker_header_layer = None;
                 ticker_header_text = None;
+                sysinfo_layer = None;
                 last_media = None; // reset media so we check again when not idle
+            } else if show_sysinfo {
+                // System info replaces the clock and media
+                if notif_layer.is_none() {
+                    notif_update(
+                        &mut dev,
+                        &mut notif_layer,
+                        config.status_notify,
+                        is_connected,
+                        notif_expiry,
+                    );
+                }
+                dev.remove_layers(&time_layers);
+                dev.remove_layers(&media_layers);
+                time_layers.clear();
+                media_layers.clear();
+                last_media = None;
+                let margin = match config.oled_shift {
+                    ConfigShiftMode::Off => 0,
+                    ConfigShiftMode::Low => 1,
+                    ConfigShiftMode::High => 4,
+                };
+                let bitmap = Arc::new(ggoled_sysinfo::render(&sysinfo.snapshot(), &sysinfo_fonts, margin));
+                dev.pause();
+                if let Some(id) = sysinfo_layer.take() {
+                    dev.remove_layer(id);
+                }
+                sysinfo_layer = Some(dev.add_layer(DrawLayer::Image { bitmap, x: 0, y: 0 }));
+                dev.play();
             } else if show_ticker {
                 // Price ticker replaces the clock and media
                 if notif_layer.is_none() {

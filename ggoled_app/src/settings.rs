@@ -30,6 +30,7 @@ enum Tab {
     Display,
     Ticker,
     Schedule,
+    SystemInfo,
     Scarlett,
 }
 
@@ -46,6 +47,10 @@ struct SettingsApp {
     new_symbol: String,
     new_compact: String,
     scarlett_command: String,
+    /// Live readings, to show which sources work
+    sysinfo: ggoled_sysinfo::SysInfo,
+    new_game: String,
+    new_ignore: String,
 }
 
 fn file_mtime() -> Option<SystemTime> {
@@ -69,6 +74,13 @@ impl SettingsApp {
             last_file_check: Instant::now(),
             new_symbol: String::new(),
             new_compact: String::new(),
+            sysinfo: {
+                let s = ggoled_sysinfo::SysInfo::new(Default::default());
+                s.set_active(true);
+                s
+            },
+            new_game: String::new(),
+            new_ignore: String::new(),
         }
     }
 
@@ -125,6 +137,7 @@ impl eframe::App for SettingsApp {
                     (Tab::Display, "Display"),
                     (Tab::Ticker, "Ticker"),
                     (Tab::Schedule, "Schedule"),
+                    (Tab::SystemInfo, "System info"),
                     (Tab::Scarlett, "Scarlett"),
                 ] {
                     ui.selectable_value(&mut self.tab, tab, RichText::new(name).size(15.0));
@@ -180,6 +193,16 @@ impl eframe::App for SettingsApp {
                     Tab::Display => display_tab(ui, &mut self.edit),
                     Tab::Ticker => ticker_tab(ui, &mut self.edit, &mut self.new_symbol, &mut self.new_compact),
                     Tab::Schedule => schedule_tab(ui, &mut self.edit),
+                    Tab::SystemInfo => {
+                        self.sysinfo.set_config(&self.edit.sysinfo);
+                        sysinfo_tab(
+                            ui,
+                            &mut self.edit,
+                            &self.sysinfo,
+                            &mut self.new_game,
+                            &mut self.new_ignore,
+                        )
+                    }
                     Tab::Scarlett => scarlett_tab(ui, &mut self.edit, &mut self.scarlett_command),
                 });
         });
@@ -211,9 +234,10 @@ fn combo<T: PartialEq + Copy>(ui: &mut Ui, id: &str, value: &mut T, options: &[(
         });
 }
 
-const DISPLAY_OPTIONS: [(DisplayMode, &str); 4] = [
+const DISPLAY_OPTIONS: [(DisplayMode, &str); 5] = [
     (DisplayMode::Normal, "Clock & media"),
     (DisplayMode::Ticker, "Price ticker"),
+    (DisplayMode::SystemInfo, "System info"),
     (DisplayMode::Blank, "Blank"),
     (DisplayMode::Stock, "SteelSeries screen"),
 ];
@@ -856,6 +880,141 @@ fn schedule_tab(ui: &mut Ui, c: &mut Config) {
             ..Default::default()
         });
     }
+}
+
+/// An editable list of program names.
+fn program_list(ui: &mut Ui, id: &str, list: &mut Vec<String>, new: &mut String, placeholder: &str) {
+    let mut remove = None;
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([10.0, 4.0])
+        .striped(true)
+        .show(ui, |ui| {
+            for (i, name) in list.iter().enumerate() {
+                ui.label(RichText::new(name).monospace());
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(i);
+                }
+                ui.end_row();
+            }
+        });
+    if let Some(i) = remove {
+        list.remove(i);
+    }
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(new)
+                .hint_text(placeholder)
+                .desired_width(200.0),
+        );
+        let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let name = new.trim().to_string();
+        let ok = !name.is_empty() && !list.iter().any(|p| p.eq_ignore_ascii_case(&name));
+        if (ui.add_enabled(ok, egui::Button::new("Add")).clicked() || enter) && ok {
+            list.push(name);
+            new.clear();
+        }
+    });
+}
+
+fn source_line(ui: &mut Ui, name: &str, status: &ggoled_sysinfo::SourceStatus, provides: &str) {
+    use ggoled_sysinfo::SourceStatus;
+    let (mark, color, detail) = match status {
+        SourceStatus::Ok => ("Working", Color32::from_rgb(110, 200, 120), None),
+        SourceStatus::Unavailable(why) => ("Not available", Color32::from_rgb(230, 170, 60), Some(why.clone())),
+        SourceStatus::NotChecked => ("Checking...", Color32::GRAY, None),
+    };
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new(name).strong());
+        ui.label(RichText::new(mark).color(color));
+        ui.weak(format!("- {provides}"));
+    });
+    if let Some(why) = detail {
+        ui.indent(name, |ui| hint(ui, &why));
+    }
+}
+
+fn sysinfo_tab(
+    ui: &mut Ui,
+    c: &mut Config,
+    live: &ggoled_sysinfo::SysInfo,
+    new_game: &mut String,
+    new_ignore: &mut String,
+) {
+    let s = &mut c.sysinfo;
+    heading(ui, "Games");
+    ui.checkbox(&mut s.auto_when_gaming, "Show system info while a game is in front");
+    ui.horizontal(|ui| {
+        ui.label("Keep showing it for");
+        seconds(ui, &mut s.linger_secs, 0..=120);
+        ui.label("after switching away");
+    });
+    hint(
+        ui,
+        "A game is a program RTSS is measuring frames for, or one in the list below. \
+         This takes priority over the schedule, except while the PC is locked.",
+    );
+    heading(ui, "Data sources");
+    let sources = live.sources();
+    source_line(
+        ui,
+        "NVIDIA driver",
+        &sources.nvidia,
+        "GPU load, temperature, power, VRAM",
+    );
+    source_line(ui, "LibreHardwareMonitor", &sources.lhm, "CPU temperature");
+    source_line(ui, "RTSS", &sources.rtss, "FPS, game detection");
+    ui.horizontal(|ui| {
+        ui.label("LibreHardwareMonitor address");
+        ui.add(egui::TextEdit::singleline(&mut s.lhm_url).desired_width(260.0));
+    });
+    hint(
+        ui,
+        "CPU load and RAM always work. For CPU temperature, run LibreHardwareMonitor with \
+         Options > Remote Web Server > Run. For FPS, keep RivaTuner Statistics Server running.",
+    );
+
+    heading(ui, "Right now");
+    let snap = live.snapshot();
+    let fmt = |v: Option<f32>, unit: &str| v.map(|v| format!("{v:.0}{unit}")).unwrap_or_else(|| "--".into());
+    egui::Grid::new("live")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            ui.label("CPU");
+            ui.label(format!("{}  {}", fmt(snap.cpu_load, "%"), fmt(snap.cpu_temp, "°C")));
+            ui.end_row();
+            ui.label("GPU");
+            ui.label(format!(
+                "{}  {}  {}",
+                fmt(snap.gpu_load, "%"),
+                fmt(snap.gpu_temp, "°C"),
+                fmt(snap.gpu_power, " W")
+            ));
+            ui.end_row();
+            ui.label("Memory");
+            ui.label(format!(
+                "VRAM {} GB, RAM {} GB",
+                snap.vram_used.map(|v| format!("{v:.1}")).unwrap_or_else(|| "--".into()),
+                snap.ram_used.map(|v| format!("{v:.1}")).unwrap_or_else(|| "--".into())
+            ));
+            ui.end_row();
+        });
+    hint(
+        ui,
+        "Game detection looks at the window in front, which is this one while it's open.",
+    );
+
+    heading(ui, "Which programs are games");
+    ui.label("Always treat as games");
+    program_list(ui, "games", &mut s.game_programs, new_game, "e.g. Warframe.x64.exe");
+    hint(ui, "Find a game's program name in Task Manager (Details tab).");
+    ui.add_space(4.0);
+    egui::CollapsingHeader::new(format!("Never treat as games ({})", s.ignore_programs.len()))
+        .id_salt("ignore_list")
+        .show(ui, |ui| {
+            program_list(ui, "ignore", &mut s.ignore_programs, new_ignore, "e.g. chrome.exe");
+        });
 }
 
 fn scarlett_tab(ui: &mut Ui, c: &mut Config, command: &mut String) {

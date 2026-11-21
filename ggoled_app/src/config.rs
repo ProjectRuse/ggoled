@@ -3,6 +3,7 @@
 
 use crate::schedule::{self, DisplayMode, Segment, Timing};
 use ggoled_draw::ShiftMode;
+use ggoled_sysinfo::SysInfoConfig;
 use ggoled_ticker::TickerConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -72,6 +73,7 @@ pub struct Config {
     /// What the screen shows (schedule entries can override this).
     pub display: DisplayMode,
     pub ticker: TickerConfig,
+    pub sysinfo: SysInfoConfig,
     /// Follow the [[schedule]] entries below.
     pub schedule_enabled: bool,
     /// Days that "weekends" means in the schedule (the rest are "weekdays"),
@@ -126,6 +128,7 @@ impl Default for Config {
             quit_mode: ConfigQuitMode::default(),
             display: DisplayMode::Normal,
             ticker: TickerConfig::default(),
+            sysinfo: SysInfoConfig::default(),
             schedule_enabled: false,
             weekend_days: "sat-sun".into(),
             scarlett: ScarlettConfig::default(),

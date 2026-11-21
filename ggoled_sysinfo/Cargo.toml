@@ -1,0 +1,27 @@
+[package]
+name = "ggoled_sysinfo"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+ggoled_lib = { path = "../ggoled_lib" }
+ggoled_draw = { path = "../ggoled_draw" }
+ggoled_ticker = { path = "../ggoled_ticker" }
+
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", default-features = false }
+nvml-wrapper = "0.13.0"
+sysinfo = { version = "0.40.4", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+image = "0.25"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -10,6 +10,7 @@ sdl3-static = ["sdl3-sys/build-from-source-static"]
 ggoled_lib = { path = "../ggoled_lib" }
 ggoled_draw = { path = "../ggoled_draw" }
 ggoled_ticker = { path = "../ggoled_ticker" }
+ggoled_sysinfo = { path = "../ggoled_sysinfo" }
 
 anyhow = "1"
 chrono = "0.4"

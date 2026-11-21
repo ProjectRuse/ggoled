@@ -59,7 +59,7 @@ scarlett_led_timeout = 1800
 | `name` | Shown in the tray |
 | `days` | `"daily"`, `"weekdays"`, `"weekends"`, day names `"mon"` … `"sun"`, or ranges like `"fri-sun"`; a list, combinable. Empty = daily |
 | `start` | `"HH:MM"`, 24-hour |
-| `display` | `"Normal"` (time/media as enabled), `"Ticker"` (price ticker), `"Blank"` (dark; volume changes still show briefly), `"Stock"` (SteelSeries UI) |
+| `display` | `"Normal"` (time/media as enabled), `"Ticker"` (price ticker), `"SystemInfo"`, `"Blank"` (dark; volume changes still show briefly), `"Stock"` (SteelSeries UI) |
 | `time_mode` | `"Off"`, `"H24"`, `"H12"` |
 | `show_media` | `true` / `false` |
 | `screensaver` | `true` / `false` |

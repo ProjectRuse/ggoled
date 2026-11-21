@@ -545,7 +545,7 @@ fn draw_trend(b: &mut Bitmap, q: &Quote, x: isize, y: isize, w: usize, h: usize)
     }
 }
 
-fn blit(b: &mut Bitmap, src: &Bitmap, x: isize, y: isize) {
+pub fn blit(b: &mut Bitmap, src: &Bitmap, x: isize, y: isize) {
     b.blit(src, x, y, false);
 }
 
@@ -597,16 +597,16 @@ pub const GRID_ROWS: usize = 4;
 
 // Where the ink sits inside a rendered line of the pixel font (measured):
 // 16px font: rows 4..=14 (incl. commas), 32px: rows 8..=29.
-const SMALL_INK_TOP: isize = 4;
-const SMALL_INK_H: isize = 11;
-const BIG_INK_TOP: isize = 8;
-const BIG_INK_H: isize = 22;
+pub const SMALL_INK_TOP: isize = 4;
+pub const SMALL_INK_H: isize = 11;
+pub const BIG_INK_TOP: isize = 8;
+pub const BIG_INK_H: isize = 22;
 /// The compact row: two lines of the 5x7 font with a 1px gap.
 const COMPACT_H: isize = 2 * font5x7::GLYPH_H as isize + 1;
 
 /// Spread blocks of the given heights evenly over the screen height inside the
 /// margin; returns each block's top y.
-fn spread(heights: &[isize], margin: usize) -> Vec<isize> {
+pub fn spread(heights: &[isize], margin: usize) -> Vec<isize> {
     let avail = (HEIGHT - 2 * margin) as isize;
     let total: isize = heights.iter().sum();
     let gaps = heights.len().saturating_sub(1) as isize;

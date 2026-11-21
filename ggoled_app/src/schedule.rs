@@ -17,6 +17,8 @@ pub enum DisplayMode {
     Stock,
     /// Show the price ticker.
     Ticker,
+    /// Show CPU/GPU/memory readings (and FPS in games).
+    SystemInfo,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
