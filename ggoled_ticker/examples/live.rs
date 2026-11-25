@@ -19,8 +19,9 @@ fn main() {
                 i + 1,
                 q.iter()
                     .map(|q| format!(
-                        "{} {:?} {:?} err {:?}",
+                        "{} {:?} {:?} {:?} err {:?}",
                         q.display_label(),
+                        q.session,
                         q.price,
                         q.change_pct().map(format_change),
                         q.error

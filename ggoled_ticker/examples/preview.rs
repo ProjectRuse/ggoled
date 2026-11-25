@@ -32,15 +32,19 @@ fn main() {
         ..Default::default()
     };
     let mut fetched = fetch_all(&agent, &cfg.all_symbols()).unwrap();
-    for q in fetched.iter_mut() {
-        if has_extended_hours(&q.symbol)
-            && let Ok(ext) = fetch_extended(&agent, &q.symbol)
-        {
-            println!(
-                "{}: session {:?} price {:?} vs close {:?}",
-                ext.symbol, ext.session, ext.price, ext.prev_close
-            );
-            *q = ext;
+    let stocks: Vec<String> = fetched
+        .iter()
+        .map(|q| q.symbol.clone())
+        .filter(|s| has_extended_hours(s))
+        .collect();
+    if let Ok(prices) = YahooSession::default().extended_prices(&stocks) {
+        for q in fetched.iter_mut() {
+            if let Some(ext) = prices.get(&q.symbol) {
+                println!("{}: {:?}", q.symbol, ext);
+                q.price = Some(ext.price);
+                q.prev_close = Some(ext.reference);
+                q.session = ext.session;
+            }
         }
     }
     let get = |sym: &String| {

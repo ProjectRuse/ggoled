@@ -133,8 +133,10 @@ pub enum Session {
     Regular,
     /// Pre-market; change is measured from the last regular close
     Pre,
-    /// After hours (or later, until pre-market); change is from today's close
+    /// After hours; change is from today's close
     Post,
+    /// Overnight session (8pm-4am ET); change is from the last close
+    Overnight,
 }
 impl Session {
     /// Short tag shown after the symbol
@@ -143,6 +145,7 @@ impl Session {
             Session::Regular => None,
             Session::Pre => Some("PRE"),
             Session::Post => Some("AH"),
+            Session::Overnight => Some("OVN"),
         }
     }
 }
@@ -296,6 +299,117 @@ pub fn has_extended_hours(symbol: &str) -> bool {
     !symbol.starts_with('^') && !symbol.contains('-') && !symbol.contains('=')
 }
 
+/// Yahoo's quote endpoint needs a session cookie and a "crumb" token, obtained
+/// the way a browser does (no account). Kept between requests; refreshed when
+/// Yahoo stops accepting it.
+pub struct YahooSession {
+    agent: ureq::Agent,
+    crumb: Option<String>,
+}
+impl Default for YahooSession {
+    fn default() -> Self {
+        Self {
+            agent: ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .user_agent("Mozilla/5.0 (ggoled)")
+                .http_status_as_error(false)
+                .build()
+                .into(),
+            crumb: None,
+        }
+    }
+}
+
+/// The newest price for a stock outside regular hours.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtendedPrice {
+    pub price: f64,
+    /// Last regular-session close, which the change is measured from
+    pub reference: f64,
+    pub session: Session,
+}
+
+impl YahooSession {
+    fn crumb(&mut self) -> anyhow::Result<String> {
+        if let Some(c) = &self.crumb {
+            return Ok(c.clone());
+        }
+        // sets the session cookie (the response itself is a 404)
+        _ = self.agent.get("https://fc.yahoo.com").call();
+        let mut resp = self
+            .agent
+            .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
+            .call()?;
+        let crumb = resp.body_mut().read_to_string()?.trim().to_string();
+        if resp.status() != 200 || crumb.is_empty() || crumb.contains(['{', '<', ' ']) {
+            anyhow::bail!("couldn't get a Yahoo session token");
+        }
+        self.crumb = Some(crumb.clone());
+        Ok(crumb)
+    }
+
+    /// Pre-market, after-hours or overnight prices for these stocks, whichever is
+    /// newest, if newer than the regular session. One request for all of them.
+    pub fn extended_prices(
+        &mut self,
+        symbols: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, ExtendedPrice>> {
+        for attempt in 0..2 {
+            let crumb = self.crumb()?;
+            let url = format!(
+                "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}&crumb={}&fields=regularMarketPrice,regularMarketTime,preMarketPrice,preMarketTime,postMarketPrice,postMarketTime,overnightMarketPrice,overnightMarketTime&overnightPrice=true",
+                symbols.join(","),
+                crumb
+            );
+            let mut resp = self.agent.get(&url).header("Cache-Control", "no-cache").call()?;
+            match resp.status().as_u16() {
+                200 => {}
+                401 | 403 if attempt == 0 => {
+                    self.crumb = None; // expired; get a new one and retry
+                    continue;
+                }
+                429 => return Err(RateLimited.into()),
+                code => anyhow::bail!("Yahoo quote request failed ({code})"),
+            }
+            let json: serde_json::Value = serde_json::from_str(&resp.body_mut().read_to_string()?)?;
+            let results = json["quoteResponse"]["result"].as_array().cloned().unwrap_or_default();
+            let mut out = std::collections::HashMap::new();
+            for r in results {
+                let Some(symbol) = r["symbol"].as_str() else { continue };
+                if let Some(ext) = pick_extended(&r) {
+                    out.insert(symbol.to_string(), ext);
+                }
+            }
+            return Ok(out);
+        }
+        anyhow::bail!("Yahoo didn't accept the session token")
+    }
+}
+
+/// From a quote result, the newest out-of-hours price (if newer than the
+/// regular session's).
+fn pick_extended(r: &serde_json::Value) -> Option<ExtendedPrice> {
+    let reference = r["regularMarketPrice"].as_f64()?;
+    let regular_time = r["regularMarketTime"].as_i64().unwrap_or(0);
+    [
+        ("preMarket", Session::Pre),
+        ("postMarket", Session::Post),
+        ("overnightMarket", Session::Overnight),
+    ]
+    .into_iter()
+    .filter_map(|(key, session)| {
+        let price = r[format!("{key}Price")].as_f64()?;
+        let time = r[format!("{key}Time")].as_i64()?;
+        (time > regular_time).then_some((time, price, session))
+    })
+    .max_by_key(|(time, _, _)| *time)
+    .map(|(_, price, session)| ExtendedPrice {
+        price,
+        reference,
+        session,
+    })
+}
+
 /// A stock's quote including pre-market and after-hours trading. If the newest
 /// trade is outside regular hours, that's the price shown, with the change
 /// measured from the last regular-session close.
@@ -441,7 +555,9 @@ impl Ticker {
             let mut last_fetch: Option<Instant> = None;
             let mut backoff = Duration::ZERO;
             let mut pending = false;
-            let mut ext_cache: std::collections::HashMap<String, (Quote, Instant)> = Default::default();
+            let mut yahoo = YahooSession::default();
+            let mut ext_prices: std::collections::HashMap<String, ExtendedPrice> = Default::default();
+            let mut ext_fetched: Option<Instant> = None;
             loop {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
@@ -469,20 +585,50 @@ impl Ticker {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
+                        let quiet: Vec<String> = quotes
+                            .iter()
+                            .filter(|q| {
+                                has_extended_hours(&q.symbol) && q.last_trade.is_none_or(|t| now_unix - t > 7 * 60)
+                            })
+                            .map(|q| q.symbol.clone())
+                            .collect();
+                        // One quote request for all of them, once a minute
+                        if !quiet.is_empty()
+                            && ext_fetched.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60))
+                        {
+                            ext_fetched = Some(Instant::now());
+                            match yahoo.extended_prices(&quiet) {
+                                Ok(prices) => ext_prices = prices,
+                                // fallback: chart data with pre/after-hours (no overnight)
+                                Err(_) => {
+                                    ext_prices = quiet
+                                        .iter()
+                                        .filter_map(|sym| {
+                                            let q = fetch_extended(&agent, sym).ok()?;
+                                            if q.session == Session::Regular {
+                                                return None;
+                                            }
+                                            let ext = ExtendedPrice {
+                                                price: q.price?,
+                                                reference: q.prev_close?,
+                                                session: q.session,
+                                            };
+                                            Some((sym.clone(), ext))
+                                        })
+                                        .collect()
+                                }
+                            }
+                        }
+                        if quiet.is_empty() {
+                            ext_prices.clear();
+                        }
                         for q in quotes.iter_mut() {
-                            let quiet = q.last_trade.is_none_or(|t| now_unix - t > 7 * 60);
-                            if !has_extended_hours(&q.symbol) || !quiet {
-                                ext_cache.remove(&q.symbol);
-                                continue;
-                            }
-                            let fresh = ext_cache
-                                .get(&q.symbol)
-                                .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(60));
-                            if !fresh && let Ok(ext) = fetch_extended(&agent, &q.symbol) {
-                                ext_cache.insert(q.symbol.clone(), (ext, Instant::now()));
-                            }
-                            if let Some((ext, _)) = ext_cache.get(&q.symbol) {
-                                *q = ext.clone();
+                            if quiet.contains(&q.symbol)
+                                && let Some(ext) = ext_prices.get(&q.symbol)
+                            {
+                                q.price = Some(ext.price);
+                                q.prev_close = Some(ext.reference);
+                                q.session = ext.session;
                             }
                         }
                     }
@@ -839,11 +985,9 @@ pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fo
         }
     }
     for q in main.iter().take(main_rows) {
-        let y = rows.next().unwrap() - SMALL_INK_TOP;
-        let label = fonts.small.render_line(&q.display_label());
-        blit(&mut b, &label, left, y);
-        let label_end =
-            left + label.w as isize + draw_session_tag(&mut b, q, left + label.w as isize + 3, y + SMALL_INK_TOP + 2);
+        let ink_top = *rows.next().unwrap();
+        let y = ink_top - SMALL_INK_TOP;
+        // right side: change, then price to its left
         let mut x_right = right;
         if let Some(pct) = q.change_pct() {
             let ch = fonts.small.render_line(&format_change(pct));
@@ -854,6 +998,22 @@ pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fo
         let price_text = q.price.map(format_price).unwrap_or_else(|| "--".into());
         let price = fonts.small.render_line(&price_text);
         let px = x_right - price.w as isize;
+        // left side: symbol, plus a PRE/AH/OVN tag after it if there's room,
+        // otherwise symbol and tag stacked in the small font
+        let label = fonts.small.render_line(&q.display_label());
+        let tag_w = q.session.tag().map_or(0, |t| font5x7::text_width(t) as isize + 3);
+        let label_end = if left + label.w as isize + tag_w + 2 < px || q.session.tag().is_none() {
+            blit(&mut b, &label, left, y);
+            draw_session_tag(&mut b, q, left + label.w as isize + 3, ink_top + 2);
+            left + label.w as isize + tag_w
+        } else {
+            let name = font5x7::render(&q.display_label());
+            let tag = font5x7::render(q.session.tag().unwrap_or(""));
+            let top = ink_top + SMALL_INK_H / 2 - font5x7::GLYPH_H as isize; // centered on the row
+            blit(&mut b, &name, left, top);
+            blit(&mut b, &tag, left, top + font5x7::GLYPH_H as isize + 1);
+            left + name.w.max(tag.w) as isize
+        };
         if px > label_end + 2 {
             blit(&mut b, &price, px, y);
         }
@@ -997,5 +1157,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn picks_newest_extended_price() {
+        let r: serde_json::Value = serde_json::from_str(
+            r#"{"symbol":"MSTR","regularMarketPrice":77.55,"regularMarketTime":1000,
+                "postMarketPrice":77.33,"postMarketTime":2000,
+                "overnightMarketPrice":76.54,"overnightMarketTime":3000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_extended(&r),
+            Some(ExtendedPrice {
+                price: 76.54,
+                reference: 77.55,
+                session: Session::Overnight
+            })
+        );
+        // during regular hours nothing newer exists
+        let r: serde_json::Value = serde_json::from_str(
+            r#"{"regularMarketPrice":80.0,"regularMarketTime":5000,"preMarketPrice":79.0,"preMarketTime":4000}"#,
+        )
+        .unwrap();
+        assert_eq!(pick_extended(&r), None);
     }
 }

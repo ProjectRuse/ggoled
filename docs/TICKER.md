@@ -47,12 +47,15 @@ each switch, so every asset appears with a current price. If Yahoo starts
 refusing requests, the ticker backs off automatically, and a price more than
 two minutes old gets a `?` after its symbol. Today's change is
 measured from the previous close (for crypto, roughly since midnight UTC).
-Outside regular trading hours, stocks and ETFs show their pre-market (4–9:30am
-ET) or after-hours (4–8pm ET) price, tagged **PRE** or **AH**, with the change
-measured from the last regular-session close. Between 8pm and 4am the 8pm
-after-hours price stays up (Yahoo has no overnight-session data). Indexes and
-crypto aren't affected. This uses one extra request per stock, about once a
-minute, only while the market is closed.
+Outside regular trading hours, stocks and ETFs show their newest
+extended-hours price, tagged **PRE** (pre-market, 4–9:30am ET), **AH**
+(after hours, 4–8pm ET) or **OVN** (overnight, 8pm–4am ET), with the change
+measured from the last regular-session close, like Yahoo's page. Indexes and
+crypto aren't affected. This takes one extra request per minute for all
+stocks together, only while the market is closed. It uses Yahoo's quote
+endpoint, which needs a session token that ggoled gets the way a browser does
+(no account); if that ever stops working, it falls back to pre-market and
+after-hours prices from the chart data (no overnight).
 
 The data comes from Yahoo Finance's public (unofficial) chart endpoint, which
 needs no API key but could change without notice.
