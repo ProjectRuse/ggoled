@@ -324,6 +324,8 @@ impl Default for YahooSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtendedPrice {
     pub price: f64,
+    /// Unix time of that price
+    pub time: i64,
     /// Last regular-session close, which the change is measured from
     pub reference: f64,
     pub session: Session,
@@ -356,8 +358,13 @@ impl YahooSession {
     ) -> anyhow::Result<std::collections::HashMap<String, ExtendedPrice>> {
         for attempt in 0..2 {
             let crumb = self.crumb()?;
+            // unique URL so no cache answers with an old price (as in `get`)
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
             let url = format!(
-                "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}&crumb={}&fields=regularMarketPrice,regularMarketTime,preMarketPrice,preMarketTime,postMarketPrice,postMarketTime,overnightMarketPrice,overnightMarketTime&overnightPrice=true",
+                "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}&crumb={}&fields=regularMarketPrice,regularMarketTime,preMarketPrice,preMarketTime,postMarketPrice,postMarketTime,overnightMarketPrice,overnightMarketTime&overnightPrice=true&_={nonce}",
                 symbols.join(","),
                 crumb
             );
@@ -403,8 +410,9 @@ fn pick_extended(r: &serde_json::Value) -> Option<ExtendedPrice> {
         (time > regular_time).then_some((time, price, session))
     })
     .max_by_key(|(time, _, _)| *time)
-    .map(|(_, price, session)| ExtendedPrice {
+    .map(|(time, price, session)| ExtendedPrice {
         price,
+        time,
         reference,
         session,
     })
@@ -557,7 +565,8 @@ impl Ticker {
             let mut pending = false;
             let mut yahoo = YahooSession::default();
             let mut ext_prices: std::collections::HashMap<String, ExtendedPrice> = Default::default();
-            let mut ext_fetched: Option<Instant> = None;
+            let mut ext_paused_until: Option<Instant> = None;
+            let mut ext_fallback_at: Option<Instant> = None;
             loop {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
@@ -592,15 +601,23 @@ impl Ticker {
                             })
                             .map(|q| q.symbol.clone())
                             .collect();
-                        // One quote request for all of them, once a minute
-                        if !quiet.is_empty()
-                            && ext_fetched.is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60))
-                        {
-                            ext_fetched = Some(Instant::now());
+                        // One quote request for all of them, with every refresh (unless
+                        // Yahoo asked us to slow down)
+                        let paused = ext_paused_until.is_some_and(|t: Instant| Instant::now() < t);
+                        if !quiet.is_empty() && !paused {
                             match yahoo.extended_prices(&quiet) {
                                 Ok(prices) => ext_prices = prices,
-                                // fallback: chart data with pre/after-hours (no overnight)
-                                Err(_) => {
+                                Err(e) if e.is::<RateLimited>() => {
+                                    // keep the last prices; try again in a minute
+                                    ext_paused_until = Some(Instant::now() + Duration::from_secs(60));
+                                }
+                                // Fallback: chart data with pre/after-hours (no overnight),
+                                // one request per stock, so at most once a minute
+                                Err(_)
+                                    if ext_fallback_at
+                                        .is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) =>
+                                {
+                                    ext_fallback_at = Some(Instant::now());
                                     ext_prices = quiet
                                         .iter()
                                         .filter_map(|sym| {
@@ -610,13 +627,15 @@ impl Ticker {
                                             }
                                             let ext = ExtendedPrice {
                                                 price: q.price?,
+                                                time: q.last_trade.unwrap_or(0),
                                                 reference: q.prev_close?,
                                                 session: q.session,
                                             };
                                             Some((sym.clone(), ext))
                                         })
-                                        .collect()
+                                        .collect();
                                 }
+                                Err(_) => {}
                             }
                         }
                         if quiet.is_empty() {
@@ -1171,6 +1190,7 @@ mod tests {
             pick_extended(&r),
             Some(ExtendedPrice {
                 price: 76.54,
+                time: 3000,
                 reference: 77.55,
                 session: Session::Overnight
             })
