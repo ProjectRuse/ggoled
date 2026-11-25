@@ -121,6 +121,30 @@ pub struct Quote {
     pub intraday: Vec<f64>,
     pub updated: Option<Instant>,
     pub error: Option<String>,
+    /// Pre-market or after-hours price (stocks outside regular trading hours)
+    pub session: Session,
+    /// Unix time of the latest data point
+    pub last_trade: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Session {
+    #[default]
+    Regular,
+    /// Pre-market; change is measured from the last regular close
+    Pre,
+    /// After hours (or later, until pre-market); change is from today's close
+    Post,
+}
+impl Session {
+    /// Short tag shown after the symbol
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            Session::Regular => None,
+            Session::Pre => Some("PRE"),
+            Session::Post => Some("AH"),
+        }
+    }
 }
 impl Quote {
     /// Short name for display: "BTC-USD" -> "BTC", "^GSPC" -> "GSPC"
@@ -160,14 +184,25 @@ struct Chart {
 #[derive(Deserialize)]
 struct ChartResult {
     meta: ChartMeta,
+    timestamp: Option<Vec<i64>>,
     indicators: Option<Indicators>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChartMeta {
     regular_market_price: Option<f64>,
+    regular_market_time: Option<i64>,
     chart_previous_close: Option<f64>,
     previous_close: Option<f64>,
+    current_trading_period: Option<TradingPeriods>,
+}
+#[derive(Deserialize)]
+struct TradingPeriods {
+    regular: Option<TradingPeriod>,
+}
+#[derive(Deserialize)]
+struct TradingPeriod {
+    start: i64,
 }
 #[derive(Deserialize)]
 struct Indicators {
@@ -189,6 +224,7 @@ fn agent() -> ureq::Agent {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SparkEntry {
+    timestamp: Option<Vec<i64>>,
     close: Option<Vec<Option<f64>>>,
     chart_previous_close: Option<f64>,
     previous_close: Option<f64>,
@@ -228,7 +264,16 @@ pub fn fetch_all(agent: &ureq::Agent, symbols: &[String]) -> anyhow::Result<Vec<
         let mut map: std::collections::HashMap<String, SparkEntry> = serde_json::from_str(&get(agent, &url)?)?;
         for symbol in chunk {
             let Some(entry) = map.remove(symbol) else { continue };
-            let intraday: Vec<f64> = entry.close.unwrap_or_default().into_iter().flatten().collect();
+            let closes = entry.close.unwrap_or_default();
+            let last_trade = entry
+                .timestamp
+                .unwrap_or_default()
+                .iter()
+                .zip(&closes)
+                .rev()
+                .find(|(_, c)| c.is_some())
+                .map(|(t, _)| *t);
+            let intraday: Vec<f64> = closes.into_iter().flatten().collect();
             quotes.push(Quote {
                 symbol: symbol.clone(),
                 name: String::new(),
@@ -237,10 +282,75 @@ pub fn fetch_all(agent: &ureq::Agent, symbols: &[String]) -> anyhow::Result<Vec<
                 intraday,
                 updated: Some(Instant::now()),
                 error: None,
+                session: Session::Regular,
+                last_trade,
             });
         }
     }
     Ok(quotes)
+}
+
+/// Whether a symbol is a stock or ETF that can trade before/after hours (not an
+/// index "^...", crypto pair "BTC-USD", or currency/futures "EURUSD=X", "ES=F").
+pub fn has_extended_hours(symbol: &str) -> bool {
+    !symbol.starts_with('^') && !symbol.contains('-') && !symbol.contains('=')
+}
+
+/// A stock's quote including pre-market and after-hours trading. If the newest
+/// trade is outside regular hours, that's the price shown, with the change
+/// measured from the last regular-session close.
+pub fn fetch_extended(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
+    let url = format!(
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=5m&includePrePost=true",
+        symbol.replace('^', "%5E")
+    );
+    let resp: ChartResponse = serde_json::from_str(&get(agent, &url)?)?;
+    let result = resp
+        .chart
+        .result
+        .and_then(|mut r| r.pop())
+        .ok_or_else(|| anyhow::anyhow!("no data for {symbol}"))?;
+    let closes = result
+        .indicators
+        .and_then(|i| i.quote.into_iter().next())
+        .and_then(|q| q.close)
+        .unwrap_or_default();
+    let points: Vec<(i64, f64)> = result
+        .timestamp
+        .unwrap_or_default()
+        .into_iter()
+        .zip(closes)
+        .filter_map(|(t, c)| c.map(|c| (t, c)))
+        .collect();
+    let meta = &result.meta;
+    let mut quote = Quote {
+        symbol: symbol.to_string(),
+        name: String::new(),
+        price: meta.regular_market_price,
+        prev_close: meta.chart_previous_close.or(meta.previous_close),
+        intraday: points.iter().map(|(_, c)| *c).collect(),
+        updated: Some(Instant::now()),
+        error: None,
+        session: Session::Regular,
+        last_trade: points.last().map(|(t, _)| *t).or(meta.regular_market_time),
+    };
+    if let (Some(&(t, price)), Some(reg_time), Some(reg_price)) =
+        (points.last(), meta.regular_market_time, meta.regular_market_price)
+        && t > reg_time + 60
+    {
+        let regular_start = meta
+            .current_trading_period
+            .as_ref()
+            .and_then(|p| p.regular.as_ref())
+            .map(|r| r.start);
+        quote.session = match regular_start {
+            Some(start) if t < start => Session::Pre,
+            _ => Session::Post,
+        };
+        quote.price = Some(price);
+        quote.prev_close = Some(reg_price);
+    }
+    Ok(quote)
 }
 
 pub fn fetch_quote(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
@@ -274,6 +384,8 @@ pub fn fetch_quote(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
         intraday,
         updated: Some(Instant::now()),
         error: None,
+        session: Session::Regular,
+        last_trade: result.meta.regular_market_time,
     })
 }
 
@@ -329,6 +441,7 @@ impl Ticker {
             let mut last_fetch: Option<Instant> = None;
             let mut backoff = Duration::ZERO;
             let mut pending = false;
+            let mut ext_cache: std::collections::HashMap<String, (Quote, Instant)> = Default::default();
             loop {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
@@ -344,11 +457,35 @@ impl Ticker {
                     last_fetch = Some(Instant::now());
                     pending = false;
                     // one request for everything; per-symbol requests only as a fallback
-                    let result = match fetch_all(&agent, &symbols) {
+                    let mut result = match fetch_all(&agent, &symbols) {
                         Err(e) if e.is::<RateLimited>() => Err(e),
                         Err(_) => Ok(symbols.iter().filter_map(|s| fetch_quote(&agent, s).ok()).collect()),
                         ok => ok,
                     };
+                    // Stocks whose regular-session data has gone quiet (market closed):
+                    // get pre-market/after-hours prices, at most once a minute each
+                    if let Ok(quotes) = &mut result {
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        for q in quotes.iter_mut() {
+                            let quiet = q.last_trade.is_none_or(|t| now_unix - t > 7 * 60);
+                            if !has_extended_hours(&q.symbol) || !quiet {
+                                ext_cache.remove(&q.symbol);
+                                continue;
+                            }
+                            let fresh = ext_cache
+                                .get(&q.symbol)
+                                .is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(60));
+                            if !fresh && let Ok(ext) = fetch_extended(&agent, &q.symbol) {
+                                ext_cache.insert(q.symbol.clone(), (ext, Instant::now()));
+                            }
+                            if let Some((ext, _)) = ext_cache.get(&q.symbol) {
+                                *q = ext.clone();
+                            }
+                        }
+                    }
                     let mut s = thread_shared.lock();
                     match result {
                         Ok(new) => {
@@ -559,6 +696,7 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
     let top = margin as isize - SMALL_INK_TOP;
     let label = fonts.small.render_line(&q.display_label());
     blit(&mut b, &label, left, top);
+    draw_session_tag(&mut b, q, left + label.w as isize + 3, margin as isize + 2);
     if let Some(pct) = q.change_pct() {
         let ch = fonts.small.render_line(&format_change(pct));
         blit(&mut b, &ch, right - ch.w as isize, top);
@@ -591,6 +729,19 @@ pub fn render_cycle(q: &Quote, fonts: &Fonts, margin: usize) -> Bitmap {
         }
     }
     b
+}
+
+/// Small "AH"/"PRE" tag in the 5x7 font at (x, y); returns the width used
+/// (including a 2px lead-in gap), 0 if there's no tag.
+fn draw_session_tag(b: &mut Bitmap, q: &Quote, x: isize, y: isize) -> isize {
+    match q.session.tag() {
+        Some(tag) => {
+            let t = font5x7::render(tag);
+            blit(b, &t, x, y);
+            t.w as isize + 2
+        }
+        None => 0,
+    }
 }
 
 pub const GRID_ROWS: usize = 4;
@@ -691,6 +842,8 @@ pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fo
         let y = rows.next().unwrap() - SMALL_INK_TOP;
         let label = fonts.small.render_line(&q.display_label());
         blit(&mut b, &label, left, y);
+        let label_end =
+            left + label.w as isize + draw_session_tag(&mut b, q, left + label.w as isize + 3, y + SMALL_INK_TOP + 2);
         let mut x_right = right;
         if let Some(pct) = q.change_pct() {
             let ch = fonts.small.render_line(&format_change(pct));
@@ -701,7 +854,7 @@ pub fn render_grid(main: &[Quote], compact: &[Quote], header: Header, fonts: &Fo
         let price_text = q.price.map(format_price).unwrap_or_else(|| "--".into());
         let price = fonts.small.render_line(&price_text);
         let px = x_right - price.w as isize;
-        if px > left + label.w as isize + 2 {
+        if px > label_end + 2 {
             blit(&mut b, &price, px, y);
         }
     }
@@ -733,6 +886,10 @@ pub fn scroll_text(quotes: &[Quote]) -> String {
         .iter()
         .map(|q| {
             let mut s = q.display_label();
+            if let Some(tag) = q.session.tag() {
+                s += " ";
+                s += tag;
+            }
             s += " ";
             s += &q.price.map(format_price).unwrap_or_else(|| "--".into());
             if let Some(pct) = q.change_pct() {
@@ -819,7 +976,9 @@ mod tests {
                 .collect(),
             ..Default::default()
         };
-        let main = [q("BTC-USD", "BTC", 159_033.5), q("MSTR", "MSTR", 81.01)];
+        let mut mstr = q("MSTR", "MSTR", 1081.01);
+        mstr.session = Session::Pre; // widest tag
+        let main = [q("BTC-USD", "BTC", 159_033.5), mstr];
         let compact = [
             q("^GSPC", "S&P", 6000.0),
             q("^DJI", "DOW", 44000.0),
@@ -828,7 +987,8 @@ mod tests {
         for margin in [0, 1, 4] {
             let grid = render_grid(&main, &compact, Header::Text("12:55:03 PM"), &fonts, margin);
             let cycle = render_cycle(&main[0], &fonts, margin);
-            for b in [grid, cycle] {
+            let cycle_tagged = render_cycle(&main[1], &fonts, margin);
+            for b in [grid, cycle, cycle_tagged] {
                 let (x0, y0, x1, y1) = ink_bounds(&b).unwrap();
                 assert!(x0 >= margin && y0 >= margin, "margin {margin}: {x0},{y0}");
                 assert!(

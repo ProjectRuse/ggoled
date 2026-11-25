@@ -31,7 +31,18 @@ fn main() {
         symbols: args[2..].to_vec(),
         ..Default::default()
     };
-    let fetched = fetch_all(&agent, &cfg.all_symbols()).unwrap();
+    let mut fetched = fetch_all(&agent, &cfg.all_symbols()).unwrap();
+    for q in fetched.iter_mut() {
+        if has_extended_hours(&q.symbol)
+            && let Ok(ext) = fetch_extended(&agent, &q.symbol)
+        {
+            println!(
+                "{}: session {:?} price {:?} vs close {:?}",
+                ext.symbol, ext.session, ext.price, ext.prev_close
+            );
+            *q = ext;
+        }
+    }
     let get = |sym: &String| {
         let mut q = fetched.iter().find(|q| &q.symbol == sym).cloned().unwrap_or_default();
         q.name = cfg.name_for(sym);

@@ -47,8 +47,12 @@ each switch, so every asset appears with a current price. If Yahoo starts
 refusing requests, the ticker backs off automatically, and a price more than
 two minutes old gets a `?` after its symbol. Today's change is
 measured from the previous close (for crypto, roughly since midnight UTC).
-Stock prices follow regular trading hours only (no pre/after-market moves),
-and some exchanges' data may be delayed.
+Outside regular trading hours, stocks and ETFs show their pre-market (4–9:30am
+ET) or after-hours (4–8pm ET) price, tagged **PRE** or **AH**, with the change
+measured from the last regular-session close. Between 8pm and 4am the 8pm
+after-hours price stays up (Yahoo has no overnight-session data). Indexes and
+crypto aren't affected. This uses one extra request per stock, about once a
+minute, only while the market is closed.
 
 The data comes from Yahoo Finance's public (unofficial) chart endpoint, which
 needs no API key but could change without notice.
