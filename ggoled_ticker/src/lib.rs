@@ -342,6 +342,9 @@ impl YahooSession {
             .agent
             .get("https://query1.finance.yahoo.com/v1/test/getcrumb")
             .call()?;
+        if resp.status() == 429 {
+            return Err(RateLimited.into());
+        }
         let crumb = resp.body_mut().read_to_string()?.trim().to_string();
         if resp.status() != 200 || crumb.is_empty() || crumb.contains(['{', '<', ' ']) {
             anyhow::bail!("couldn't get a Yahoo session token");
@@ -423,7 +426,7 @@ fn pick_extended(r: &serde_json::Value) -> Option<ExtendedPrice> {
 /// measured from the last regular-session close.
 pub fn fetch_extended(agent: &ureq::Agent, symbol: &str) -> anyhow::Result<Quote> {
     let url = format!(
-        "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=5m&includePrePost=true",
+        "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=1m&includePrePost=true",
         symbol.replace('^', "%5E")
     );
     let resp: ChartResponse = serde_json::from_str(&get(agent, &url)?)?;
@@ -565,8 +568,8 @@ impl Ticker {
             let mut pending = false;
             let mut yahoo = YahooSession::default();
             let mut ext_prices: std::collections::HashMap<String, ExtendedPrice> = Default::default();
-            let mut ext_paused_until: Option<Instant> = None;
-            let mut ext_fallback_at: Option<Instant> = None;
+            let mut quote_retry_at: Option<Instant> = None;
+            let mut quote_backoff = Duration::ZERO;
             loop {
                 let (symbols, refresh, active) = {
                     let s = thread_shared.lock();
@@ -601,41 +604,44 @@ impl Ticker {
                             })
                             .map(|q| q.symbol.clone())
                             .collect();
-                        // One quote request for all of them, with every refresh (unless
-                        // Yahoo asked us to slow down)
-                        let paused = ext_paused_until.is_some_and(|t: Instant| Instant::now() < t);
-                        if !quiet.is_empty() && !paused {
-                            match yahoo.extended_prices(&quiet) {
-                                Ok(prices) => ext_prices = prices,
-                                Err(e) if e.is::<RateLimited>() => {
-                                    // keep the last prices; try again in a minute
-                                    ext_paused_until = Some(Instant::now() + Duration::from_secs(60));
-                                }
-                                // Fallback: chart data with pre/after-hours (no overnight),
-                                // one request per stock, so at most once a minute
-                                Err(_)
-                                    if ext_fallback_at
-                                        .is_none_or(|t: Instant| t.elapsed() >= Duration::from_secs(60)) =>
-                                {
-                                    ext_fallback_at = Some(Instant::now());
-                                    ext_prices = quiet
-                                        .iter()
-                                        .filter_map(|sym| {
-                                            let q = fetch_extended(&agent, sym).ok()?;
-                                            if q.session == Session::Regular {
-                                                return None;
-                                            }
-                                            let ext = ExtendedPrice {
-                                                price: q.price?,
+                        // Pre-market / after hours: the chart data has the latest trade,
+                        // live, without a session token (one request per stock).
+                        let mut need_quote = vec![];
+                        for sym in &quiet {
+                            let recent = |q: &Quote| q.last_trade.is_some_and(|t| now_unix - t < 15 * 60);
+                            match fetch_extended(&agent, sym) {
+                                Ok(q) if q.session != Session::Regular && recent(&q) => {
+                                    if let (Some(price), Some(reference)) = (q.price, q.prev_close) {
+                                        ext_prices.insert(
+                                            sym.clone(),
+                                            ExtendedPrice {
+                                                price,
                                                 time: q.last_trade.unwrap_or(0),
-                                                reference: q.prev_close?,
+                                                reference,
                                                 session: q.session,
-                                            };
-                                            Some((sym.clone(), ext))
-                                        })
-                                        .collect();
+                                            },
+                                        );
+                                    }
                                 }
-                                Err(_) => {}
+                                // nothing recent: overnight session (or the chart failed)
+                                _ => need_quote.push(sym.clone()),
+                            }
+                        }
+                        // Overnight: only the quote endpoint has it. It needs a session
+                        // token; if Yahoo refuses, keep the last prices and wait before
+                        // asking again (5 min, doubling up to 30) rather than every refresh.
+                        let waiting = quote_retry_at.is_some_and(|t: Instant| Instant::now() < t);
+                        if !need_quote.is_empty() && !waiting {
+                            match yahoo.extended_prices(&need_quote) {
+                                Ok(prices) => {
+                                    quote_backoff = Duration::ZERO;
+                                    ext_prices.extend(prices);
+                                }
+                                Err(_) => {
+                                    quote_backoff =
+                                        (quote_backoff * 2).clamp(Duration::from_secs(300), Duration::from_secs(1800));
+                                    quote_retry_at = Some(Instant::now() + quote_backoff);
+                                }
                             }
                         }
                         if quiet.is_empty() {

@@ -51,12 +51,12 @@ Outside regular trading hours, stocks and ETFs show their newest
 extended-hours price, tagged **PRE** (pre-market, 4–9:30am ET), **AH**
 (after hours, 4–8pm ET) or **OVN** (overnight, 8pm–4am ET), with the change
 measured from the last regular-session close, like Yahoo's page. Indexes and
-crypto aren't affected. These update at the same rate as everything else, with
-one extra request per refresh for all stocks together, only while the market
-is closed (paused for a minute if Yahoo says to slow down). It uses Yahoo's quote
-endpoint, which needs a session token that ggoled gets the way a browser does
-(no account); if that ever stops working, it falls back to pre-market and
-after-hours prices from the chart data (no overnight).
+crypto aren't affected. Pre-market and after-hours prices come from Yahoo's
+chart data and update with every refresh (one request per stock, only while the
+market is closed). Overnight prices need Yahoo's quote endpoint, which requires
+a session token that ggoled gets the way a browser does (no account); if Yahoo
+refuses it, the last price stays up and ggoled waits 5-30 minutes before
+asking again.
 
 The data comes from Yahoo Finance's public (unofficial) chart endpoint, which
 needs no API key but could change without notice.
